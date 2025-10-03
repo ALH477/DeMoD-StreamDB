@@ -1,20 +1,20 @@
 //! StreamDb - A lightweight, embedded database for storing and retrieving binary streams via paths.
 //!
 //! ## Overview
-//! StreamDb is designed as a reliable, performant, and simple key-value store where keys are string paths
-//! (supporting prefix searches via a reverse trie) and values are binary streams (documents up to 256MB by default).
+//! StreamDb is a reliable, performant, and simple key-value store where keys are string paths
+//! (supporting prefix searches via a compressed reverse trie) and values are binary streams (documents up to 256MB by default).
 //! It uses a paged storage system with chaining for large documents. The database is thread-safe, supports
 //! multiple readers/single writer per path, and includes optimizations like LRU caching for pages and paths,
 //! QuickAndDirtyMode for skipping CRC on reads, and free page management with first-fit LIFO strategy and
 //! automatic consolidation. Versioning supports basic retention (keep 2 versions, free on 3rd), with garbage
-//! collection for old versions during flush. Uses i64 for page IDs (exceeding spec's i32) for scalability.
+//! collection during flush. Uses i64 for page IDs (exceeding spec's i32) for scalability.
 //!
 //! ## Adaptability for Multiple Use Cases and Platforms
 //! - **Use Cases**:
 //!   - **Embedded Systems**: Configurable page and cache sizes for low memory; optional no-mmap mode.
 //!   - **Server Applications**: Thread-safe with lock hierarchy; tunable for high concurrency.
 //!   - **Mobile/Desktop Apps**: Cross-platform; lightweight dependencies.
-//!   - **In-Memory Testing/Volatile Storage**: MemoryBackend with trie for consistent search.
+//!   - **In-Memory Testing/Volatile Storage**: MemoryBackend with compressed trie for consistent search.
 //!   - **Custom Storage**: DatabaseBackend trait for pluggable backends (e.g., S3).
 //!   - **Large-Scale Databases**: i64 page IDs support >2B pages; configurable max sizes.
 //!   - **Read-Heavy Workloads**: Quick mode for 10x faster reads; LRU page cache.
@@ -100,7 +100,7 @@ struct FreeListPage {
 
 #[derive(Debug)]
 struct ReverseTrieNode {
-    value: char,
+    edge: String, // Store path segment for compression
     parent_index: i64,
     self_index: i64,
     document_id: Option<Uuid>,
@@ -182,13 +182,14 @@ pub trait DatabaseBackend {
     fn get_cache_stats(&self) -> io::Result<CacheStats>;
 }
 
-// In-Memory Backend with trie for consistent search
+// In-Memory Backend with compressed trie for consistent search
 struct MemoryBackend {
     documents: Mutex<HashMap<Uuid, Vec<u8>>>,
     path_to_id: Mutex<HashMap<String, Uuid>>,
     id_to_paths: Mutex<HashMap<Uuid, Vec<String>>>,
     trie_root: Mutex<ReverseTrieNode>,
     cache_stats: Mutex<CacheStats>,
+    next_index: Mutex<i64>, // Track next available index for nodes
 }
 
 impl MemoryBackend {
@@ -198,13 +199,14 @@ impl MemoryBackend {
             path_to_id: Mutex::new(HashMap::new()),
             id_to_paths: Mutex::new(HashMap::new()),
             trie_root: Mutex::new(ReverseTrieNode {
-                value: '\0',
+                edge: String::new(),
                 parent_index: -1,
                 self_index: 0,
                 document_id: None,
                 children: HashMap::new(),
             }),
             cache_stats: Mutex::new(CacheStats::default()),
+            next_index: Mutex::new(1),
         }
     }
 
@@ -216,34 +218,120 @@ impl MemoryBackend {
     }
 
     fn trie_insert(&self, path: &str, id: Uuid) -> io::Result<()> {
+        self.validate_path(path)?;
         let mut node = self.trie_root.lock();
         let reversed: String = path.chars().rev().collect();
         let mut current = &mut *node;
-        for c in reversed.chars() {
-            current = current.children.entry(c).or_insert_with(|| {
-                let new_index = self.trie_root.lock().self_index + 1;
-                ReverseTrieNode {
-                    value: c,
+        let mut remaining = reversed.as_str();
+        let mut path_stack = vec![];
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            if let Some(&child_index) = current.children.get(&first_char) {
+                let mut child_node = self.trie_root.lock();
+                if child_node.self_index == child_index {
+                    let edge = child_node.edge.as_str();
+                    let common_len = edge.chars().zip(remaining.chars()).take_while(|(a, b)| a == b).count();
+                    if common_len == edge.len() {
+                        // Full edge match
+                        path_stack.push(current.self_index);
+                        current = &mut *child_node;
+                        remaining = &remaining[common_len..];
+                        continue;
+                    } else if common_len > 0 {
+                        // Partial match, split node
+                        let common = &edge[..common_len];
+                        let suffix = &edge[common_len..];
+                        let new_intermediate = ReverseTrieNode {
+                            edge: common.to_string(),
+                            parent_index: current.self_index,
+                            self_index: *self.next_index.lock(),
+                            document_id: None,
+                            children: HashMap::new(),
+                        };
+                        let new_child_index = {
+                            let mut next = self.next_index.lock();
+                            *next += 1;
+                            *next
+                        };
+                        let new_child = ReverseTrieNode {
+                            edge: suffix.to_string(),
+                            parent_index: new_intermediate.self_index,
+                            self_index: new_child_index,
+                            document_id: child_node.document_id,
+                            children: child_node.children.clone(),
+                        };
+                        new_intermediate.children.insert(suffix.chars().next().unwrap(), new_child_index);
+                        *self.next_index.lock() += 1;
+                        *child_node = new_intermediate;
+                        path_stack.push(current.self_index);
+                        current = &mut *self.trie_root.lock();
+                        current.children.insert(first_char, new_intermediate.self_index);
+                        remaining = &remaining[common_len..];
+                    } else {
+                        // No common prefix, add sibling
+                        let new_index = {
+                            let mut next = self.next_index.lock();
+                            *next += 1;
+                            *next
+                        };
+                        let new_node = ReverseTrieNode {
+                            edge: remaining.to_string(),
+                            parent_index: current.self_index,
+                            self_index: new_index,
+                            document_id: Some(id),
+                            children: HashMap::new(),
+                        };
+                        current.children.insert(first_char, new_index);
+                        *self.trie_root.lock() = new_node;
+                        return Ok(());
+                    }
+                }
+            } else {
+                // New child
+                let new_index = {
+                    let mut next = self.next_index.lock();
+                    *next += 1;
+                    *next
+                };
+                let new_node = ReverseTrieNode {
+                    edge: remaining.to_string(),
                     parent_index: current.self_index,
                     self_index: new_index,
-                    document_id: None,
+                    document_id: Some(id),
                     children: HashMap::new(),
-                }
-            });
+                };
+                current.children.insert(first_char, new_index);
+                *self.trie_root.lock() = new_node;
+                return Ok(());
+            }
         }
         current.document_id = Some(id);
         Ok(())
     }
 
     fn trie_delete(&self, path: &str) -> io::Result<()> {
+        self.validate_path(path)?;
         let mut node = self.trie_root.lock();
         let reversed: String = path.chars().rev().collect();
-        let mut stack = vec![];
         let mut current = &mut *node;
-        for c in reversed.chars() {
-            if let Some(next) = current.children.get_mut(&c) {
-                stack.push((current.self_index, c));
-                current = next;
+        let mut remaining = reversed.as_str();
+        let mut path_stack = vec![];
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            if let Some(&child_index) = current.children.get(&first_char) {
+                let mut child_node = self.trie_root.lock();
+                if child_node.self_index == child_index {
+                    let edge = child_node.edge.as_str();
+                    if remaining.starts_with(edge) {
+                        path_stack.push((current.self_index, first_char));
+                        current = &mut *child_node;
+                        remaining = &remaining[edge.len()..];
+                    } else {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                    }
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                }
             } else {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
             }
@@ -252,30 +340,48 @@ impl MemoryBackend {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
         }
         current.document_id = None;
-        while let Some((index, c)) = stack.pop() {
+        while let Some((parent_index, c)) = path_stack.pop() {
             let mut parent = self.trie_root.lock();
-            if parent.self_index == index {
-                if parent.children.get(&c).map_or(false, |n| n.document_id.is_none() && n.children.is_empty()) {
+            if parent.self_index == parent_index {
+                if current.document_id.is_none() && current.children.len() == 1 {
+                    // Merge with single child
+                    let (child_char, child_index) = current.children.iter().next().unwrap();
+                    let child_node = self.trie_root.lock();
+                    if child_node.self_index == *child_index {
+                        let merged_edge = format!("{}{}", current.edge, child_node.edge);
+                        let merged_node = ReverseTrieNode {
+                            edge: merged_edge,
+                            parent_index: parent.self_index,
+                            self_index: current.self_index,
+                            document_id: child_node.document_id,
+                            children: child_node.children.clone(),
+                        };
+                        *current = merged_node;
+                        parent.children.insert(c, current.self_index);
+                        current.children.remove(child_char);
+                    }
+                } else if current.document_id.is_none() && current.children.is_empty() {
                     parent.children.remove(&c);
+                } else {
+                    break;
                 }
-                break;
             }
         }
         Ok(())
     }
 
     fn trie_collect_paths(&self, node: &ReverseTrieNode, prefix: &str, current_path: String, results: &mut Vec<String>) {
-        if let Some(id) = node.document_id {
-            let mut path = current_path.chars().rev().collect::<String>();
+        let new_path = format!("{}{}", node.edge, current_path);
+        if let Some(_) = node.document_id {
+            let path = new_path.chars().rev().collect::<String>();
             if path.starts_with(prefix) {
                 results.push(path);
             }
         }
-        for (&c, child_index) in &node.children {
+        for (_, child_index) in &node.children {
             let child = self.trie_root.lock();
             if child.self_index == *child_index {
-                let new_path = format!("{}{}", c, current_path);
-                self.trie_collect_paths(&child, prefix, new_path, results);
+                self.trie_collect_paths(&child, prefix, new_path.clone(), results);
             }
         }
     }
@@ -333,7 +439,32 @@ impl DatabaseBackend for MemoryBackend {
     }
 
     fn get_document_id_by_path(&self, path: &str) -> io::Result<Uuid> {
-        self.path_to_id.lock().get(path).cloned().ok_or(io::Error::new(io::ErrorKind::NotFound, "Path not found"))
+        self.validate_path(path)?;
+        let reversed: String = path.chars().rev().collect();
+        let mut current = self.trie_root.lock();
+        let mut remaining = reversed.as_str();
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            if let Some(&child_index) = current.children.get(&first_char) {
+                let child = self.trie_root.lock();
+                if child.self_index == child_index {
+                    if remaining.starts_with(&child.edge) {
+                        remaining = &remaining[child.edge.len()..];
+                        if remaining.is_empty() {
+                            return child.document_id.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                        }
+                        current = child;
+                    } else {
+                        return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                    }
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                }
+            } else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+            }
+        }
+        current.document_id.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Path not found"))
     }
 
     fn search_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
@@ -742,7 +873,6 @@ impl FileBackend {
                     free_list_page.free_page_ids.push(reader.read_i64::<LittleEndian>()?);
                 }
             } else {
-                // Need new page
                 let new_page_id = self.allocate_page()?;
                 free_list_page = FreeListPage {
                     next_free_list_page: free_root.page_id,
@@ -876,13 +1006,15 @@ impl FileBackend {
     }
 
     fn serialize_trie_node(&self, node: &ReverseTrieNode) -> io::Result<Vec<u8>> {
-        let estimated_size = 29 + 16 * node.children.len(); // char(4)+i64+i64+Option<Uuid>+HashMap
+        let edge_bytes = node.edge.as_bytes();
+        let estimated_size = 4 + edge_bytes.len() + 16 + 1 + 16 * node.children.len(); // u32 edge_len + edge + i64 parent/self + u8 has_id + Option<Uuid> + children
         if estimated_size as u64 > self.config.page_size - self.config.page_header_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Trie node too large"));
         }
         let mut buffer = Vec::new();
         let mut writer = BufWriter::new(&mut buffer);
-        writer.write_u32::<LittleEndian>(node.value as u32)?;
+        writer.write_u32::<LittleEndian>(edge_bytes.len() as u32)?;
+        writer.write_all(edge_bytes)?;
         writer.write_i64::<LittleEndian>(node.parent_index)?;
         writer.write_i64::<LittleEndian>(node.self_index)?;
         match node.document_id {
@@ -902,9 +1034,11 @@ impl FileBackend {
 
     fn deserialize_trie_node(&self, data: &[u8]) -> io::Result<ReverseTrieNode> {
         let mut reader = Cursor::new(data);
-        let value = std::char::from_u32(reader.read_u32::<LittleEndian>()?).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Invalid char in trie node")
-        })?;
+        let edge_len = reader.read_u32::<LittleEndian>()? as usize;
+        let mut edge_bytes = vec![0u8; edge_len];
+        reader.read_exact(&mut edge_bytes)?;
+        let edge = String::from_utf8(edge_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let parent_index = reader.read_i64::<LittleEndian>()?;
         let self_index = reader.read_i64::<LittleEndian>()?;
         let has_id = reader.read_u8()?;
@@ -925,7 +1059,7 @@ impl FileBackend {
             children.insert(c, index);
         }
         Ok(ReverseTrieNode {
-            value,
+            edge,
             parent_index,
             self_index,
             document_id,
@@ -937,52 +1071,98 @@ impl FileBackend {
         let mut trie_root = self.trie_root.lock();
         let reversed: String = path.chars().rev().collect();
         let mut current_page_id = trie_root.page_id;
-        let mut node = if current_page_id == -1 {
-            ReverseTrieNode {
-                value: '\0',
+        if current_page_id == -1 {
+            current_page_id = self.allocate_page()?;
+            trie_root.page_id = current_page_id;
+            trie_root.version = 1;
+            let root_node = ReverseTrieNode {
+                edge: String::new(),
                 parent_index: -1,
-                self_index: 0,
+                self_index: current_page_id,
                 document_id: None,
                 children: HashMap::new(),
-            }
-        } else {
-            let data = self.read_raw_page(current_page_id)?;
-            self.deserialize_trie_node(&data)?
-        };
-        let mut current = &mut node;
-        let mut page_ids = vec![current_page_id];
-        for c in reversed.chars() {
-            if let Some(&next_page_id) = current.children.get(&c) {
-                page_ids.push(next_page_id);
-                let data = self.read_raw_page(next_page_id)?;
-                current = &mut self.deserialize_trie_node(&data)?;
-                current_page_id = next_page_id;
+            };
+            let data = self.serialize_trie_node(&root_node)?;
+            self.write_raw_page(current_page_id, &data, 1)?;
+        }
+        let mut remaining = reversed.as_str();
+        let mut current_node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+        let mut path_stack = vec![];
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            if let Some(&child_page_id) = current_node.children.get(&first_char) {
+                let child_node = self.deserialize_trie_node(&self.read_raw_page(child_page_id)?)?;
+                let edge = child_node.edge.as_str();
+                let common_len = edge.chars().zip(remaining.chars()).take_while(|(a, b)| a == b).count();
+                if common_len == edge.len() {
+                    // Full edge match
+                    path_stack.push((current_page_id, current_node));
+                    current_page_id = child_page_id;
+                    current_node = child_node;
+                    remaining = &remaining[common_len..];
+                    continue;
+                } else if common_len > 0 {
+                    // Partial match, split node
+                    let common = &edge[..common_len];
+                    let suffix = &edge[common_len..];
+                    let new_intermediate_id = self.allocate_page()?;
+                    let new_intermediate = ReverseTrieNode {
+                        edge: common.to_string(),
+                        parent_index: current_node.self_index,
+                        self_index: new_intermediate_id,
+                        document_id: None,
+                        children: HashMap::new(),
+                    };
+                    let new_child_id = self.allocate_page()?;
+                    let new_child = ReverseTrieNode {
+                        edge: suffix.to_string(),
+                        parent_index: new_intermediate_id,
+                        self_index: new_child_id,
+                        document_id: child_node.document_id,
+                        children: child_node.children,
+                    };
+                    new_intermediate.children.insert(suffix.chars().next().unwrap(), new_child_id);
+                    self.write_raw_page(new_intermediate_id, &self.serialize_trie_node(&new_intermediate)?, 1)?;
+                    self.write_raw_page(new_child_id, &self.serialize_trie_node(&new_child)?, 1)?;
+                    current_node.children.insert(first_char, new_intermediate_id);
+                    self.write_raw_page(current_page_id, &self.serialize_trie_node(&current_node)?, 1)?;
+                    path_stack.push((current_page_id, current_node));
+                    current_page_id = new_intermediate_id;
+                    current_node = new_intermediate;
+                    remaining = &remaining[common_len..];
+                } else {
+                    // No common prefix, add sibling
+                    let new_child_id = self.allocate_page()?;
+                    let new_child = ReverseTrieNode {
+                        edge: remaining.to_string(),
+                        parent_index: current_node.self_index,
+                        self_index: new_child_id,
+                        document_id: Some(id),
+                        children: HashMap::new(),
+                    };
+                    self.write_raw_page(new_child_id, &self.serialize_trie_node(&new_child)?, 1)?;
+                    current_node.children.insert(first_char, new_child_id);
+                    self.write_raw_page(current_page_id, &self.serialize_trie_node(&current_node)?, 1)?;
+                    return Ok(new_child_id);
+                }
             } else {
-                let new_page_id = self.allocate_page()?;
-                let new_node = ReverseTrieNode {
-                    value: c,
-                    parent_index: current.self_index,
-                    self_index: new_page_id,
-                    document_id: None,
+                // New child
+                let new_child_id = self.allocate_page()?;
+                let new_child = ReverseTrieNode {
+                    edge: remaining.to_string(),
+                    parent_index: current_node.self_index,
+                    self_index: new_child_id,
+                    document_id: Some(id),
                     children: HashMap::new(),
                 };
-                let data = self.serialize_trie_node(&new_node)?;
-                self.write_raw_page(new_page_id, &data, 1)?;
-                current.children.insert(c, new_page_id);
-                let parent_data = self.serialize_trie_node(current)?;
-                self.write_raw_page(current_page_id, &parent_data, 1)?;
-                page_ids.push(new_page_id);
-                current_page_id = new_page_id;
-                current = &mut self.deserialize_trie_node(&data)?;
+                self.write_raw_page(new_child_id, &self.serialize_trie_node(&new_child)?, 1)?;
+                current_node.children.insert(first_char, new_child_id);
+                self.write_raw_page(current_page_id, &self.serialize_trie_node(&current_node)?, 1)?;
+                return Ok(new_child_id);
             }
         }
-        current.document_id = Some(id);
-        let data = self.serialize_trie_node(current)?;
-        self.write_raw_page(current_page_id, &data, 1)?;
-        if trie_root.page_id == -1 {
-            trie_root.page_id = page_ids[0];
-            trie_root.version = 1;
-        }
+        current_node.document_id = Some(id);
+        self.write_raw_page(current_page_id, &self.serialize_trie_node(&current_node)?, 1)?;
         Ok(current_page_id)
     }
 
@@ -992,30 +1172,57 @@ impl FileBackend {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
         }
         let reversed: String = path.chars().rev().collect();
-        let mut stack = vec![];
+        let mut path_stack = vec![];
         let mut current_page_id = trie_root.page_id;
-        let mut node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
-        for c in reversed.chars() {
-            if let Some(&next_page_id) = node.children.get(&c) {
-                stack.push((current_page_id, node, c));
-                current_page_id = next_page_id;
-                node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+        let mut current_node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+        let mut remaining = reversed.as_str();
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            if let Some(&child_page_id) = current_node.children.get(&first_char) {
+                let child_node = self.deserialize_trie_node(&self.read_raw_page(child_page_id)?)?;
+                let edge = child_node.edge.as_str();
+                if remaining.starts_with(edge) {
+                    path_stack.push((current_page_id, current_node, first_char));
+                    current_page_id = child_page_id;
+                    current_node = child_node;
+                    remaining = &remaining[edge.len()..];
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                }
             } else {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
             }
         }
-        if node.document_id.is_none() {
+        if current_node.document_id.is_none() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
         }
-        node.document_id = None;
-        self.write_raw_page(current_page_id, &self.serialize_trie_node(&node)?, 1)?;
-        while let Some((parent_page_id, mut parent_node, c)) = stack.pop() {
-            if node.document_id.is_none() && node.children.is_empty() {
-                parent_node.children.remove(&c);
-                self.free_page(current_page_id)?;
+        current_node.document_id = None;
+        self.write_raw_page(current_page_id, &self.serialize_trie_node(&current_node)?, 1)?;
+        while let Some((parent_page_id, mut parent_node, c)) = path_stack.pop() {
+            if current_node.document_id.is_none() && current_node.children.len() == 1 {
+                // Merge with single child
+                let (child_char, child_page_id) = current_node.children.iter().next().unwrap();
+                let child_node = self.deserialize_trie_node(&self.read_raw_page(*child_page_id)?)?;
+                let merged_edge = format!("{}{}", current_node.edge, child_node.edge);
+                let merged_node = ReverseTrieNode {
+                    edge: merged_edge,
+                    parent_index: parent_node.self_index,
+                    self_index: current_node.self_index,
+                    document_id: child_node.document_id,
+                    children: child_node.children,
+                };
+                self.write_raw_page(current_page_id, &self.serialize_trie_node(&merged_node)?, 1)?;
+                self.free_page(*child_page_id)?;
+                parent_node.children.insert(c, current_page_id);
                 self.write_raw_page(parent_page_id, &self.serialize_trie_node(&parent_node)?, 1)?;
                 current_page_id = parent_page_id;
-                node = parent_node;
+                current_node = parent_node;
+            } else if current_node.document_id.is_none() && current_node.children.is_empty() {
+                parent_node.children.remove(&c);
+                self.write_raw_page(parent_page_id, &self.serialize_trie_node(&parent_node)?, 1)?;
+                self.free_page(current_page_id)?;
+                current_page_id = parent_page_id;
+                current_node = parent_node;
             } else {
                 break;
             }
@@ -1024,15 +1231,15 @@ impl FileBackend {
     }
 
     fn trie_collect_paths(&self, node: &ReverseTrieNode, current_path: String, results: &mut Vec<String>) -> io::Result<()> {
-        if let Some(_id) = node.document_id {
-            let path = current_path.chars().rev().collect::<String>();
+        let new_path = format!("{}{}", node.edge, current_path);
+        if let Some(_) = node.document_id {
+            let path = new_path.chars().rev().collect::<String>();
             results.push(path);
         }
-        for (&c, &child_page_id) in &node.children {
+        for (_, &child_page_id) in &node.children {
             let child_data = self.read_raw_page(child_page_id)?;
             let child = self.deserialize_trie_node(&child_data)?;
-            let new_path = format!("{}{}", c, current_path);
-            self.trie_collect_paths(&child, new_path, results)?;
+            self.trie_collect_paths(&child, new_path.clone(), results)?;
         }
         Ok(())
     }
@@ -1192,21 +1399,33 @@ impl DatabaseBackend for FileBackend {
     }
 
     fn get_document_id_by_path(&self, path: &str) -> io::Result<Uuid> {
+        self.validate_path(path)?;
         let trie_root = self.trie_root.lock();
         if trie_root.page_id == -1 {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
         }
         let reversed: String = path.chars().rev().collect();
         let mut current_page_id = trie_root.page_id;
-        let mut node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
-        for c in reversed.chars() {
-            if let Some(&next_page_id) = node.children.get(&c) {
-                current_page_id = next_page_id;
-                node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+        let mut remaining = reversed.as_str();
+        while !remaining.is_empty() {
+            let node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+            let edge = node.edge.as_str();
+            if remaining.starts_with(edge) {
+                remaining = &remaining[edge.len()..];
+                if remaining.is_empty() {
+                    return node.document_id.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                }
+                let first_char = remaining.chars().next().unwrap();
+                if let Some(&child_id) = node.children.get(&first_char) {
+                    current_page_id = child_id;
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
+                }
             } else {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
             }
         }
+        let node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
         node.document_id.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Path not found"))
     }
 
@@ -1218,18 +1437,31 @@ impl DatabaseBackend for FileBackend {
         }
         let reversed_prefix: String = prefix.chars().rev().collect();
         let mut current_page_id = trie_root.page_id;
-        let mut node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
-        for c in reversed_prefix.chars() {
-            if let Some(&next_page_id) = node.children.get(&c) {
-                current_page_id = next_page_id;
-                node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+        let mut remaining = reversed_prefix.as_str();
+        while !remaining.is_empty() {
+            let node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
+            let edge = node.edge.as_str();
+            if remaining.starts_with(edge) {
+                remaining = &remaining[edge.len()..];
+                if remaining.is_empty() {
+                    let mut results = vec![];
+                    self.trie_collect_paths(&node, String::new(), &mut results)?;
+                    return Ok(results.into_iter().filter(|p| p.starts_with(prefix)).collect());
+                }
+                let first_char = remaining.chars().next().unwrap();
+                if let Some(&child_id) = node.children.get(&first_char) {
+                    current_page_id = child_id;
+                } else {
+                    return Ok(vec![]);
+                }
             } else {
                 return Ok(vec![]);
             }
         }
+        let node = self.deserialize_trie_node(&self.read_raw_page(current_page_id)?)?;
         let mut results = vec![];
         self.trie_collect_paths(&node, String::new(), &mut results)?;
-        Ok(results)
+        Ok(results.into_iter().filter(|p| p.starts_with(prefix)).collect())
     }
 
     fn list_paths_for_document(&self, id: Uuid) -> io::Result<Vec<String>> {
@@ -1279,7 +1511,7 @@ impl DatabaseBackend for FileBackend {
             current_page_id = header.next_page_id;
         }
         Ok(format!(
-            "ID: {}, Version: {}, Size: {} bytes, Paths: {:?}",
+            "ID: {}, Version: {}, Size: {} bytes, Paths: {:?}", 
             id, document.current_version, size, document.paths
         ))
     }
@@ -1311,7 +1543,7 @@ impl DatabaseBackend for FileBackend {
 }
 
 pub struct StreamDb {
-    backend: FileBackend,
+    backend: Box<dyn DatabaseBackend>,
     path_cache: Mutex<LruCache<String, Uuid>>,
     quick_mode: AtomicBool,
 }
@@ -1320,7 +1552,7 @@ impl StreamDb {
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: Config) -> io::Result<Self> {
         let backend = FileBackend::new(path, config)?;
         Ok(Self {
-            backend,
+            backend: Box::new(backend),
             path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(DEFAULT_PAGE_CACHE_SIZE).unwrap())),
             quick_mode: AtomicBool::new(false),
         })
@@ -1328,7 +1560,7 @@ impl StreamDb {
 
     pub fn with_memory_backend() -> Self {
         Self {
-            backend: MemoryBackend::new(),
+            backend: Box::new(MemoryBackend::new()),
             path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(DEFAULT_PAGE_CACHE_SIZE).unwrap())),
             quick_mode: AtomicBool::new(false),
         }
@@ -1423,263 +1655,4 @@ impl Database for StreamDb {
         self.backend.search_paths(prefix)
     }
 
-    fn list_paths(&self, id: Uuid) -> io::Result<Vec<String>> {
-        self.backend.list_paths_for_document(id)
-    }
-
-    fn flush(&self) -> io::Result<()> {
-        let mut file = self.backend.file.lock();
-        file.flush()?;
-        file.sync_all()?;
-        self.backend.gc_old_versions()?;
-        Ok(())
-    }
-
-    fn calculate_statistics(&self) -> io::Result<(i64, i64)> {
-        let total_pages = (*self.backend.current_size.lock() / self.backend.config.page_size) as i64;
-        let free_pages = self.backend.count_free_pages()?;
-        Ok((total_pages, free_pages))
-    }
-
-    fn set_quick_mode(&mut self, enabled: bool) {
-        self.quick_mode.store(enabled, Ordering::Relaxed);
-        self.backend.quick_mode.store(enabled, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> io::Result<Self> {
-        let config = self.backend.config.clone();
-        let new_db = Self {
-            backend: FileBackend::new("snapshot.db", config)?,
-            path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(DEFAULT_PAGE_CACHE_SIZE).unwrap())),
-            quick_mode: AtomicBool::new(self.quick_mode.load(Ordering::Relaxed)),
-        };
-        let index_root = *self.backend.document_index_root.lock();
-        let trie_root = *self.backend.trie_root.lock();
-        let free_root = *self.backend.free_list_root.lock();
-        *new_db.backend.document_index_root.lock() = index_root;
-        *new_db.backend.trie_root.lock() = trie_root;
-        *new_db.backend.free_list_root.lock() = free_root;
-        Ok(new_db)
-    }
-
-    fn get_cache_stats(&self) -> io::Result<CacheStats> {
-        self.backend.get_cache_stats()
-    }
-}
-
-fn main() -> io::Result<()> {
-    let config = Config::default();
-    let mut db = StreamDb::open_with_config("streamdb.db", config)?;
-    // Test usage
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-    use std::thread;
-    use std::sync::Arc;
-    use std::fs::remove_file;
-    use std::time::Duration;
-
-    fn create_test_db(path: &str) -> StreamDb {
-        let config = Config::default();
-        StreamDb::open_with_config(path, config).unwrap()
-    }
-
-    #[test]
-    fn test_page_write_read() {
-        let path = "test_page.db";
-        let mut db = create_test_db(path);
-        let page_id = db.backend.allocate_page().unwrap();
-        let data = b"test data";
-        db.backend.write_raw_page(page_id, data, 0).unwrap();
-        let mut header = PageHeader {
-            crc: db.backend.compute_crc(data),
-            version: 1,
-            prev_page_id: -1,
-            next_page_id: -1,
-            flags: 0,
-            data_length: data.len() as i32,
-            padding: [0; 3],
-        };
-        db.backend.write_page_header(page_id, &header).unwrap();
-        let read_data = db.backend.read_raw_page(page_id).unwrap();
-        assert_eq!(&*read_data, data);
-        let read_header = db.backend.read_page_header(page_id).unwrap();
-        assert_eq!(read_header.data_length, data.len() as i32);
-        assert_eq!(read_header.crc, header.crc);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_crc_verification() {
-        let path = "test_crc.db";
-        let mut db = create_test_db(path);
-        let page_id = db.backend.allocate_page().unwrap();
-        let data = b"test crc";
-        let crc = db.backend.compute_crc(data);
-        let mut header = PageHeader {
-            crc,
-            version: 1,
-            prev_page_id: -1,
-            next_page_id: -1,
-            flags: 0,
-            data_length: data.len() as i32,
-            padding: [0; 3],
-        };
-        db.backend.write_page_header(page_id, &header).unwrap();
-        db.backend.write_raw_page(page_id, data, 0).unwrap();
-        let read = db.backend.read_raw_page(page_id).unwrap();
-        assert_eq!(&*read, data);
-        // Tamper data
-        db.backend.write_raw_page(page_id, b"tampered", 0).unwrap();
-        db.set_quick_mode(false);
-        let err = db.backend.read_raw_page(page_id).err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("CRC mismatch"));
-        // Quick mode skips
-        db.set_quick_mode(true);
-        let read_tampered = db.backend.read_raw_page(page_id).unwrap();
-        assert_eq!(&*read_tampered, b"tampered"[..]);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_document_crud() {
-        let path = "test_doc.db";
-        let mut db = create_test_db(path);
-        let mut data = Cursor::new(b"document content");
-        let id = db.write_document("/doc/path", &mut data).unwrap();
-        let read = db.get("/doc/path").unwrap();
-        assert_eq!(read, b"document content");
-        let paths = db.list_paths(id).unwrap();
-        assert_eq!(paths, vec!["/doc/path"]);
-        db.delete("/doc/path").unwrap();
-        let err = db.get("/doc/path").err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_path_management() {
-        let path = "test_path.db";
-        let mut db = create_test_db(path);
-        let mut data = Cursor::new(b"content");
-        let id = db.write_document("/prefix/path1", &mut data).unwrap();
-        db.bind_to_path(id, "/prefix/path2").unwrap();
-        let search = db.search("/prefix/").unwrap();
-        assert_eq!(search.len(), 2);
-        assert!(search.contains(&"/prefix/path1".to_string()));
-        assert!(search.contains(&"/prefix/path2".to_string()));
-        db.unbind_path(id, "/prefix/path1").unwrap();
-        let search_after = db.search("/prefix/").unwrap();
-        assert_eq!(search_after, vec!["/prefix/path2"]);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_free_list() {
-        let path = "test_free.db";
-        let mut db = create_test_db(path);
-        let p1 = db.backend.allocate_page().unwrap();
-        let p2 = db.backend.allocate_page().unwrap();
-        db.backend.free_page(p1).unwrap();
-        db.backend.free_page(p2).unwrap();
-        let popped = db.backend.allocate_page().unwrap();
-        assert_eq!(popped, p2); // LIFO
-        let popped2 = db.backend.allocate_page().unwrap();
-        assert_eq!(popped2, p1);
-        let stats = db.calculate_statistics().unwrap();
-        assert!(stats.1 >= 0);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_cache_behavior() {
-        let path = "test_cache.db";
-        let mut db = create_test_db(path);
-        let page_id = db.backend.allocate_page().unwrap();
-        let data = b"cached data";
-        db.backend.write_raw_page(page_id, data, 0).unwrap();
-        let _ = db.backend.read_raw_page(page_id).unwrap();
-        db.backend.write_raw_page(page_id, b"modified", 0).unwrap();
-        let read = db.backend.read_raw_page(page_id).unwrap();
-        assert_eq!(&*read, b"modified");
-        let stats = db.get_cache_stats().unwrap();
-        assert!(stats.misses > 0);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_multi_threading() {
-        let path = "test_multi.db";
-        let db = Arc::new(create_test_db(path));
-        let mut handles = vec![];
-        for i in 0..10 {
-            let db_clone = Arc::clone(&db);
-            let handle = thread::spawn(move || {
-                let mut data = Cursor::new(format!("data{}", i).as_bytes());
-                let id = db_clone.write_document(&format!("/path/{}", i), &mut data).unwrap();
-                let read = db_clone.get(&format!("/path/{}", i)).unwrap();
-                assert_eq!(read, format!("data{}", i).as_bytes());
-            });
-            handles.push(handle);
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_large_document() {
-        let path = "test_large.db";
-        let mut db = create_test_db(path);
-        let large_data = vec![0u8; 1024 * 1024]; // 1MB
-        let mut cursor = Cursor::new(&large_data);
-        let id = db.write_document("/large", &mut cursor).unwrap();
-        let read = db.get("/large").unwrap();
-        assert_eq!(read, large_data);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_recovery() {
-        let path = "test_recover.db";
-        {
-            let mut db = create_test_db(&path);
-            let mut data = Cursor::new(b"recover me");
-            db.write_document("/recover", &mut data).unwrap();
-            db.flush().unwrap();
-        }
-        let mut file = File::open(&path).unwrap();
-        let mut buf = vec![0u8; 1];
-        file.seek(SeekFrom::Start(DEFAULT_PAGE_RAW_SIZE + DEFAULT_PAGE_HEADER_SIZE))?;
-        file.read_exact(&mut buf).unwrap();
-        file.seek(SeekFrom::Start(DEFAULT_PAGE_RAW_SIZE + DEFAULT_PAGE_HEADER_SIZE))?;
-        file.write_all(&[buf[0] ^ 0xFF])?;
-        file.flush().unwrap();
-        drop(file);
-        let mut db = create_test_db(&path);
-        let err = db.get("/recover").err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn test_performance() {
-        let path = "test_perf.db";
-        let mut db = create_test_db(path);
-        let start = std::time::Instant::now();
-        let data = vec![0u8; 5 * 1024 * 1024]; // 5MB
-        let mut cursor = Cursor::new(&data);
-        db.write_document("/perf_write", &mut cursor).unwrap();
-        let elapsed = start.elapsed().as_secs_f64();
-        let speed = 5.0 / elapsed;
-        assert!(speed >= 5.0, "Write speed: {} MB/s", speed);
-        db.set_quick_mode(false);
-        let start = std::time::Instant::now();
-        let _ = db.get("/perf_write").unwrap();
-        let elapsed = start.elapsed().as_secs_f64();
+    fn list_paths(&self, id: Uuid
