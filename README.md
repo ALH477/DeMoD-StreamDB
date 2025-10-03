@@ -425,7 +425,7 @@ This project is licensed under the GNU General Public License v3.0 (GPLv3) - see
 
 ## Credits
 
-Developed by Asher LeRoy of DeMoD LLC, based on the original incomplete C# concept by Iain Ballard.
+Developed by Asher LeRoy of DeMoD LLC, based on the original incomplete C# concept by [Iain Ballard](https://github.com/i-e-b/StreamDb).
 
 Assisted by Grok 4, built by xAI.
 
