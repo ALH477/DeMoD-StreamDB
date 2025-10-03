@@ -49,7 +49,7 @@ StreamDb is language-agnostic in design but implemented in Rust for safety and p
 
 ## Installation
 
-StreamDb is available as a Rust crate. Add it to your `Cargo.toml`:
+StreamDb is not available as a Rust crate. When it is* Add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
