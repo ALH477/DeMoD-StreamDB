@@ -182,6 +182,44 @@ pub trait DatabaseBackend {
     fn get_cache_stats(&self) -> io::Result<CacheStats>;
 }
 
+// Varint helpers for optimized serialization
+fn write_varint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
+    loop {
+        if value < 0x80 {
+            writer.write_u8(value as u8)?;
+            break;
+        }
+        writer.write_u8((value as u8 & 0x7F) | 0x80)?;
+        value >>= 7;
+    }
+    Ok(())
+}
+
+fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = reader.read_u8()?;
+        value |= ((byte & 0x7F) as u64) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        if shift > 63 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Varint too large"));
+        }
+    }
+    Ok(value)
+}
+
+fn zigzag_encode(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+fn zigzag_decode(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ -((value & 1) as i64)
+}
+
 // In-Memory Backend with compressed trie for consistent search
 struct MemoryBackend {
     documents: Mutex<HashMap<Uuid, Vec<u8>>>,
@@ -189,7 +227,6 @@ struct MemoryBackend {
     id_to_paths: Mutex<HashMap<Uuid, Vec<String>>>,
     trie_root: Mutex<ReverseTrieNode>,
     cache_stats: Mutex<CacheStats>,
-    next_index: Mutex<i64>, // Track next available index for nodes
 }
 
 impl MemoryBackend {
@@ -206,7 +243,6 @@ impl MemoryBackend {
                 children: HashMap::new(),
             }),
             cache_stats: Mutex::new(CacheStats::default()),
-            next_index: Mutex::new(1),
         }
     }
 
@@ -217,91 +253,125 @@ impl MemoryBackend {
         Ok(())
     }
 
+    fn serialize_trie_node(&self, node: &ReverseTrieNode) -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let edge_bytes = node.edge.as_bytes();
+        write_varint(&mut buffer, edge_bytes.len() as u64)?;
+        buffer.write_all(edge_bytes)?;
+        write_varint(&mut buffer, zigzag_encode(node.parent_index))?;
+        write_varint(&mut buffer, zigzag_encode(node.self_index))?;
+        if let Some(id) = node.document_id {
+            buffer.write_u8(1)?;
+            buffer.write_all(id.as_bytes())?;
+        } else {
+            buffer.write_u8(0)?;
+        }
+        write_varint(&mut buffer, node.children.len() as u64)?;
+        for (&c, &index) in &node.children {
+            write_varint(&mut buffer, c as u64)?;
+            write_varint(&mut buffer, zigzag_encode(index))?;
+        }
+        Ok(buffer)
+    }
+
+    fn deserialize_trie_node(&self, data: &[u8]) -> io::Result<ReverseTrieNode> {
+        let mut reader = Cursor::new(data);
+        let edge_len = read_varint(&mut reader)? as usize;
+        let mut edge_bytes = vec![0u8; edge_len];
+        reader.read_exact(&mut edge_bytes)?;
+        let edge = String::from_utf8(edge_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let parent_index = zigzag_decode(read_varint(&mut reader)?);
+        let self_index = zigzag_decode(read_varint(&mut reader)?);
+        let has_id = reader.read_u8()?;
+        let document_id = if has_id == 1 {
+            let mut bytes = [0u8; 16];
+            reader.read_exact(&mut bytes)?;
+            Some(Uuid::from_bytes(bytes))
+        } else {
+            None
+        };
+        let children_count = read_varint(&mut reader)? as usize;
+        let mut children = HashMap::with_capacity(children_count);
+        for _ in 0..children_count {
+            let c = read_varint(&mut reader)?;
+            let c_char = char::try_from(c as u32)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid child char"))?;
+            let index = zigzag_decode(read_varint(&mut reader)?);
+            children.insert(c_char, index);
+        }
+        Ok(ReverseTrieNode {
+            edge,
+            parent_index,
+            self_index,
+            document_id,
+            children,
+        })
+    }
+
     fn trie_insert(&self, path: &str, id: Uuid) -> io::Result<()> {
         self.validate_path(path)?;
-        let mut node = self.trie_root.lock();
         let reversed: String = path.chars().rev().collect();
-        let mut current = &mut *node;
+        let mut current = self.trie_root.lock();
         let mut remaining = reversed.as_str();
         let mut path_stack = vec![];
         while !remaining.is_empty() {
             let first_char = remaining.chars().next().unwrap();
             if let Some(&child_index) = current.children.get(&first_char) {
-                let mut child_node = self.trie_root.lock();
-                if child_node.self_index == child_index {
-                    let edge = child_node.edge.as_str();
+                let child = self.trie_root.lock();
+                if child.self_index == child_index {
+                    let edge = child.edge.as_str();
                     let common_len = edge.chars().zip(remaining.chars()).take_while(|(a, b)| a == b).count();
                     if common_len == edge.len() {
-                        // Full edge match
                         path_stack.push(current.self_index);
-                        current = &mut *child_node;
+                        current = child;
                         remaining = &remaining[common_len..];
                         continue;
                     } else if common_len > 0 {
-                        // Partial match, split node
                         let common = &edge[..common_len];
                         let suffix = &edge[common_len..];
                         let new_intermediate = ReverseTrieNode {
                             edge: common.to_string(),
                             parent_index: current.self_index,
-                            self_index: *self.next_index.lock(),
+                            self_index: child.self_index,
                             document_id: None,
                             children: HashMap::new(),
-                        };
-                        let new_child_index = {
-                            let mut next = self.next_index.lock();
-                            *next += 1;
-                            *next
                         };
                         let new_child = ReverseTrieNode {
                             edge: suffix.to_string(),
                             parent_index: new_intermediate.self_index,
-                            self_index: new_child_index,
-                            document_id: child_node.document_id,
-                            children: child_node.children.clone(),
+                            self_index: child.self_index + 1,
+                            document_id: child.document_id,
+                            children: child.children,
                         };
-                        new_intermediate.children.insert(suffix.chars().next().unwrap(), new_child_index);
-                        *self.next_index.lock() += 1;
-                        *child_node = new_intermediate;
+                        new_intermediate.children.insert(suffix.chars().next().unwrap(), new_child.self_index);
+                        *child = new_intermediate;
                         path_stack.push(current.self_index);
-                        current = &mut *self.trie_root.lock();
-                        current.children.insert(first_char, new_intermediate.self_index);
+                        current = new_child;
                         remaining = &remaining[common_len..];
                     } else {
-                        // No common prefix, add sibling
-                        let new_index = {
-                            let mut next = self.next_index.lock();
-                            *next += 1;
-                            *next
-                        };
-                        let new_node = ReverseTrieNode {
+                        let new_child = ReverseTrieNode {
                             edge: remaining.to_string(),
                             parent_index: current.self_index,
-                            self_index: new_index,
+                            self_index: current.self_index + 1,
                             document_id: Some(id),
                             children: HashMap::new(),
                         };
-                        current.children.insert(first_char, new_index);
-                        *self.trie_root.lock() = new_node;
+                        current.children.insert(first_char, new_child.self_index);
+                        *self.trie_root.lock() = new_child;
                         return Ok(());
                     }
                 }
             } else {
-                // New child
-                let new_index = {
-                    let mut next = self.next_index.lock();
-                    *next += 1;
-                    *next
-                };
-                let new_node = ReverseTrieNode {
+                let new_child = ReverseTrieNode {
                     edge: remaining.to_string(),
                     parent_index: current.self_index,
-                    self_index: new_index,
+                    self_index: current.self_index + 1,
                     document_id: Some(id),
                     children: HashMap::new(),
                 };
-                current.children.insert(first_char, new_index);
-                *self.trie_root.lock() = new_node;
+                current.children.insert(first_char, new_child.self_index);
+                *self.trie_root.lock() = new_child;
                 return Ok(());
             }
         }
@@ -311,20 +381,19 @@ impl MemoryBackend {
 
     fn trie_delete(&self, path: &str) -> io::Result<()> {
         self.validate_path(path)?;
-        let mut node = self.trie_root.lock();
         let reversed: String = path.chars().rev().collect();
-        let mut current = &mut *node;
+        let mut current = self.trie_root.lock();
         let mut remaining = reversed.as_str();
         let mut path_stack = vec![];
         while !remaining.is_empty() {
             let first_char = remaining.chars().next().unwrap();
             if let Some(&child_index) = current.children.get(&first_char) {
-                let mut child_node = self.trie_root.lock();
-                if child_node.self_index == child_index {
-                    let edge = child_node.edge.as_str();
+                let child = self.trie_root.lock();
+                if child.self_index == child_index {
+                    let edge = child.edge.as_str();
                     if remaining.starts_with(edge) {
                         path_stack.push((current.self_index, first_char));
-                        current = &mut *child_node;
+                        current = child;
                         remaining = &remaining[edge.len()..];
                     } else {
                         return Err(io::Error::new(io::ErrorKind::NotFound, "Path not found"));
@@ -344,21 +413,20 @@ impl MemoryBackend {
             let mut parent = self.trie_root.lock();
             if parent.self_index == parent_index {
                 if current.document_id.is_none() && current.children.len() == 1 {
-                    // Merge with single child
-                    let (child_char, child_index) = current.children.iter().next().unwrap();
+                    let (child_char, child_index) = current.children.iter().next().unwrap().clone();
                     let child_node = self.trie_root.lock();
-                    if child_node.self_index == *child_index {
+                    if child_node.self_index == child_index {
                         let merged_edge = format!("{}{}", current.edge, child_node.edge);
                         let merged_node = ReverseTrieNode {
                             edge: merged_edge,
                             parent_index: parent.self_index,
                             self_index: current.self_index,
                             document_id: child_node.document_id,
-                            children: child_node.children.clone(),
+                            children: child_node.children,
                         };
                         *current = merged_node;
                         parent.children.insert(c, current.self_index);
-                        current.children.remove(child_char);
+                        current.children.remove(&child_char);
                     }
                 } else if current.document_id.is_none() && current.children.is_empty() {
                     parent.children.remove(&c);
@@ -1007,16 +1075,17 @@ impl FileBackend {
 
     fn serialize_trie_node(&self, node: &ReverseTrieNode) -> io::Result<Vec<u8>> {
         let edge_bytes = node.edge.as_bytes();
-        let estimated_size = 4 + edge_bytes.len() + 16 + 1 + 16 * node.children.len(); // u32 edge_len + edge + i64 parent/self + u8 has_id + Option<Uuid> + children
+        // Estimate size: varint for edge_len (max 5) + edge + varints for parent/self (max 10 each) + u8 + Option<Uuid>(17) + varint for children_count (max 5) + children (char varint max 5 + index varint max 10)
+        let estimated_size = 5 + edge_bytes.len() + 10 + 10 + 1 + 17 + 5 + node.children.len() * (5 + 10);
         if estimated_size as u64 > self.config.page_size - self.config.page_header_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Trie node too large"));
         }
         let mut buffer = Vec::new();
         let mut writer = BufWriter::new(&mut buffer);
-        writer.write_u32::<LittleEndian>(edge_bytes.len() as u32)?;
+        write_varint(&mut writer, edge_bytes.len() as u64)?;
         writer.write_all(edge_bytes)?;
-        writer.write_i64::<LittleEndian>(node.parent_index)?;
-        writer.write_i64::<LittleEndian>(node.self_index)?;
+        write_varint(&mut writer, zigzag_encode(node.parent_index))?;
+        write_varint(&mut writer, zigzag_encode(node.self_index))?;
         match node.document_id {
             Some(id) => {
                 writer.write_u8(1)?;
@@ -1024,23 +1093,23 @@ impl FileBackend {
             }
             None => writer.write_u8(0)?,
         }
-        writer.write_u32::<LittleEndian>(node.children.len() as u32)?;
+        write_varint(&mut writer, node.children.len() as u64)?;
         for (&c, &index) in &node.children {
-            writer.write_u32::<LittleEndian>(c as u32)?;
-            writer.write_i64::<LittleEndian>(index)?;
+            write_varint(&mut writer, c as u64)?;
+            write_varint(&mut writer, zigzag_encode(index))?;
         }
         Ok(buffer)
     }
 
     fn deserialize_trie_node(&self, data: &[u8]) -> io::Result<ReverseTrieNode> {
         let mut reader = Cursor::new(data);
-        let edge_len = reader.read_u32::<LittleEndian>()? as usize;
+        let edge_len = read_varint(&mut reader)? as usize;
         let mut edge_bytes = vec![0u8; edge_len];
         reader.read_exact(&mut edge_bytes)?;
         let edge = String::from_utf8(edge_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let parent_index = reader.read_i64::<LittleEndian>()?;
-        let self_index = reader.read_i64::<LittleEndian>()?;
+        let parent_index = zigzag_decode(read_varint(&mut reader)?);
+        let self_index = zigzag_decode(read_varint(&mut reader)?);
         let has_id = reader.read_u8()?;
         let document_id = if has_id == 1 {
             let mut bytes = [0u8; 16];
@@ -1049,14 +1118,14 @@ impl FileBackend {
         } else {
             None
         };
-        let children_count = reader.read_u32::<LittleEndian>()? as usize;
+        let children_count = read_varint(&mut reader)? as usize;
         let mut children = HashMap::with_capacity(children_count);
         for _ in 0..children_count {
-            let c = std::char::from_u32(reader.read_u32::<LittleEndian>()?).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Invalid child char")
-            })?;
-            let index = reader.read_i64::<LittleEndian>()?;
-            children.insert(c, index);
+            let c = read_varint(&mut reader)?;
+            let c_char = char::try_from(c as u32)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid child char"))?;
+            let index = zigzag_decode(read_varint(&mut reader)?);
+            children.insert(c_char, index);
         }
         Ok(ReverseTrieNode {
             edge,
@@ -1511,7 +1580,7 @@ impl DatabaseBackend for FileBackend {
             current_page_id = header.next_page_id;
         }
         Ok(format!(
-            "ID: {}, Version: {}, Size: {} bytes, Paths: {:?}", 
+            "ID: {}, Version: {}, Size: {} bytes, Paths: {:?}",
             id, document.current_version, size, document.paths
         ))
     }
@@ -1543,7 +1612,7 @@ impl DatabaseBackend for FileBackend {
 }
 
 pub struct StreamDb {
-    backend: Box<dyn DatabaseBackend>,
+    backend: Box<dyn DatabaseBackend + Send + Sync>,
     path_cache: Mutex<LruCache<String, Uuid>>,
     quick_mode: AtomicBool,
 }
@@ -1555,104 +1624,3 @@ impl StreamDb {
             backend: Box::new(backend),
             path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(DEFAULT_PAGE_CACHE_SIZE).unwrap())),
             quick_mode: AtomicBool::new(false),
-        })
-    }
-
-    pub fn with_memory_backend() -> Self {
-        Self {
-            backend: Box::new(MemoryBackend::new()),
-            path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(DEFAULT_PAGE_CACHE_SIZE).unwrap())),
-            quick_mode: AtomicBool::new(false),
-        }
-    }
-}
-
-impl Database for StreamDb {
-    fn write_document(&mut self, path: &str, data: &mut dyn Read) -> io::Result<Uuid> {
-        self.backend.validate_path(path)?;
-        let id = self.backend.write_document(data)?;
-        self.backend.bind_path_to_document(path, id)?;
-        self.path_cache.lock().put(path.to_string(), id);
-        Ok(id)
-    }
-
-    fn get(&self, path: &str) -> io::Result<Vec<u8>> {
-        self.get_quick(path, self.quick_mode.load(Ordering::Relaxed))
-    }
-
-    fn get_quick(&self, path: &str, quick: bool) -> io::Result<Vec<u8>> {
-        self.backend.validate_path(path)?;
-        let id = {
-            let mut cache = self.path_cache.lock();
-            if let Some(&id) = cache.get(path) {
-                id
-            } else {
-                let id = self.backend.get_document_id_by_path(path)?;
-                cache.put(path.to_string(), id);
-                id
-            }
-        };
-        self.backend.read_document_quick(id, quick)
-    }
-
-    fn get_id_by_path(&self, path: &str) -> io::Result<Option<Uuid>> {
-        self.backend.validate_path(path)?;
-        match self.backend.get_document_id_by_path(path) {
-            Ok(id) => {
-                self.path_cache.lock().put(path.to_string(), id);
-                Ok(Some(id))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn delete(&mut self, path: &str) -> io::Result<()> {
-        self.backend.validate_path(path)?;
-        let id = self.backend.get_document_id_by_path(path)?;
-        self.backend.trie_delete(path)?;
-        let paths = self.backend.list_paths_for_document(id)?;
-        if paths.len() <= 1 {
-            self.backend.delete_document(id)?;
-        } else {
-            self.backend.delete_paths_for_document(id)?;
-        }
-        self.path_cache.lock().pop(path);
-        Ok(())
-    }
-
-    fn delete_by_id(&mut self, id: Uuid) -> io::Result<()> {
-        self.backend.delete_document(id)?;
-        self.path_cache.lock().clear();
-        Ok(())
-    }
-
-    fn bind_to_path(&mut self, id: Uuid, path: &str) -> io::Result<()> {
-        self.backend.validate_path(path)?;
-        self.backend.bind_path_to_document(path, id)?;
-        self.path_cache.lock().put(path.to_string(), id);
-        Ok(())
-    }
-
-    fn unbind_path(&mut self, id: Uuid, path: &str) -> io::Result<()> {
-        self.backend.validate_path(path)?;
-        self.backend.trie_delete(path)?;
-        let index_root = self.backend.document_index_root.lock();
-        let data = self.backend.read_raw_page(index_root.page_id)?;
-        let mut document = self.backend.deserialize_document(&data)?;
-        if document.id != id {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "ID not found"));
-        }
-        document.paths.retain(|p| p != path);
-        let data = self.backend.serialize_document(&document)?;
-        self.backend.write_raw_page(index_root.page_id, &data, index_root.version)?;
-        self.path_cache.lock().pop(path);
-        Ok(())
-    }
-
-    fn search(&self, prefix: &str) -> io::Result<Vec<String>> {
-        self.backend.validate_path(prefix)?;
-        self.backend.search_paths(prefix)
-    }
-
-    fn list_paths(&self, id: Uuid
