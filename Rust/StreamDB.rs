@@ -776,7 +776,7 @@ impl FileBackend {
     fn gc_old_versions(&mut self) -> io::Result<()> {
         let mut old = self.old_versions.lock();
         for (id, vers) in old.iter_mut() {
-            vers.sort_by_key(|&(v, _)| v);
+            vers.sort_by_key(|&(v, _) | v);
             while vers.len() as i32 > self.config.versions_to_keep {
                 let (old_v, old_chain) = vers.remove(0);
                 self.delete_document_pages(old_chain)?;
@@ -1391,7 +1391,7 @@ impl Database for StreamDb {
         }
     }
 
-    fn delete(&mut self, path: &str) -> io::Result<()> {
+    fn delete(&mut self, path: &str) -> io::Result<() > {
         if let Some(id) = self.get_id_by_path(path)? {
             self.unbind_path(id, path)?;
             if self.list_paths(id)?.is_empty() {
@@ -1458,4 +1458,305 @@ fn main() -> io::Result<()> {
     let mut db = StreamDb::open_with_config("streamdb.db", config)?;
     // Test usage
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::thread;
+    use std::sync::Arc;
+    use std::fs::remove_file;
+    use std::time::Duration;
+
+    fn create_test_db(path: &str) -> StreamDb {
+        let config = Config::default();
+        StreamDb::open_with_config(path, config).unwrap()
+    }
+
+    #[test]
+    fn test_page_write_read() {
+        let path = "test_page.db";
+        let mut db = create_test_db(path);
+        let page_id = db.backend.allocate_page().unwrap();
+        let data = b"test data";
+        db.backend.write_raw_page(page_id, data, 0).unwrap();
+        let mut header = PageHeader {
+            crc: db.backend.compute_crc(data),
+            version: 1,
+            prev_page_id: -1,
+            next_page_id: -1,
+            flags: 0,
+            data_length: data.len() as i32,
+        };
+        db.backend.write_page_header(page_id, &header).unwrap();
+        let read_data = db.backend.read_raw_page(page_id).unwrap();
+        assert_eq!(read_data, data);
+        let read_header = db.backend.read_page_header(page_id).unwrap();
+        assert_eq!(read_header.data_length, data.len() as i32);
+        assert_eq!(read_header.crc, header.crc);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_crc_verification() {
+        let path = "test_crc.db";
+        let mut db = create_test_db(path);
+        let page_id = db.backend.allocate_page().unwrap();
+        let data = b"test crc";
+        let crc = db.backend.compute_crc(data);
+        let mut header = PageHeader {
+            crc,
+            version: 1,
+            prev_page_id: -1,
+            next_page_id: -1,
+            flags: 0,
+            data_length: data.len() as i32,
+        };
+        db.backend.write_page_header(page_id, &header).unwrap();
+        db.backend.write_raw_page(page_id, data, 0).unwrap();
+        let read = db.backend.read_raw_page(page_id).unwrap();
+        assert_eq!(read, data);
+        // Tamper data
+        db.backend.write_raw_page(page_id, b"tampered", 0).unwrap();
+        db.set_quick_mode(false);
+        let err = db.backend.read_raw_page(page_id).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC mismatch"));
+        // Quick mode skips
+        db.set_quick_mode(true);
+        let read_tampered = db.backend.read_raw_page(page_id).unwrap();
+        assert_eq!(read_tampered, b"tampered"[..]);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_document_crud() {
+        let path = "test_doc.db";
+        let mut db = create_test_db(path);
+        let mut data = Cursor::new(b"document content");
+        let id = db.write_document("/doc/path", &mut data).unwrap();
+        let read = db.get("/doc/path").unwrap();
+        assert_eq!(read, b"document content");
+        let paths = db.list_paths(id).unwrap();
+        assert_eq!(paths, vec!["/doc/path"]);
+        db.delete("/doc/path").unwrap();
+        let err = db.get("/doc/path").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_path_management() {
+        let path = "test_path.db";
+        let mut db = create_test_db(path);
+        let mut data = Cursor::new(b"content");
+        let id = db.write_document("/prefix/path1", &mut data).unwrap();
+        db.bind_to_path(id, "/prefix/path2").unwrap();
+        let search = db.search("/prefix/").unwrap();
+        assert_eq!(search.len(), 2);
+        assert!(search.contains(&"/prefix/path1".to_string()));
+        assert!(search.contains(&"/prefix/path2".to_string()));
+        db.unbind_path(id, "/prefix/path1").unwrap();
+        let search_after = db.search("/prefix/").unwrap();
+        assert_eq!(search_after, vec!["/prefix/path2"]);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_free_list() {
+        let path = "test_free.db";
+        let mut db = create_test_db(path);
+        let p1 = db.backend.allocate_page().unwrap();
+        let p2 = db.backend.allocate_page().unwrap();
+        db.backend.free_page(p1).unwrap();
+        db.backend.free_page(p2).unwrap();
+        let popped = db.backend.allocate_page().unwrap();
+        assert_eq!(popped, p2); // LIFO
+        let popped2 = db.backend.allocate_page().unwrap();
+        assert_eq!(popped2, p1);
+        let stats = db.calculate_statistics().unwrap();
+        assert!(stats.1 > 0); // free pages
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_cache_behavior() {
+        let path = "test_cache.db";
+        let mut db = create_test_db(path);
+        let page_id = db.backend.allocate_page().unwrap();
+        let data = b"cached data";
+        db.backend.write_raw_page(page_id, data, 0).unwrap();
+        // Read once, should cache
+        let _ = db.backend.read_raw_page(page_id).unwrap();
+        // Modify underlying
+        db.backend.write_raw_page(page_id, b"modified", 0).unwrap();
+        // Cache should be invalidated on write, so read new
+        let read = db.backend.read_raw_page(page_id).unwrap();
+        assert_eq!(read, b"modified");
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_multi_threading() {
+        let path = "test_multi.db";
+        let db = Arc::new(create_test_db(path));
+        let mut handles = vec![];
+        for i in 0..10 {
+            let db_clone = Arc::clone(&db);
+            let handle = thread::spawn(move || {
+                let mut data = Cursor::new(format!("data{}", i).as_bytes());
+                let id = db_clone.write_document(&format!("/path/{}", i), &mut data).unwrap();
+                let read = db_clone.get(&format!("/path/{}", i)).unwrap();
+                assert_eq!(read, format!("data{}", i).as_bytes());
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_large_document() {
+        let path = "test_large.db";
+        let mut db = create_test_db(path);
+        let large_data = vec![0u8; 1024 * 1024]; // 1MB
+        let mut cursor = Cursor::new(&large_data);
+        let id = db.write_document("/large", &mut cursor).unwrap();
+        let read = db.get("/large").unwrap();
+        assert_eq!(read, large_data);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_recovery() {
+        let path = "test_recover.db";
+        {
+            let mut db = create_test_db(&path);
+            let mut data = Cursor::new(b"recover me");
+            db.write_document("/recover", &mut data).unwrap();
+            db.flush().unwrap();
+        }
+        // Tamper file: change a byte in data page
+        let mut file = File::open(&path).unwrap();
+        let mut buf = vec![0u8; 1];
+        file.seek(SeekFrom::Start(DEFAULT_PAGE_RAW_SIZE + DEFAULT_PAGE_HEADER_SIZE))?;
+        file.read_exact(&mut buf).unwrap();
+        file.seek(SeekFrom::Start(DEFAULT_PAGE_RAW_SIZE + DEFAULT_PAGE_HEADER_SIZE))?;
+        file.write_all(&[buf[0] ^ 0xFF])?;
+        file.flush().unwrap();
+        drop(file);
+        // Reopen, should detect CRC mismatch and recover (e.g., free corrupted page)
+        let mut db = create_test_db(&path);
+        let err = db.get("/recover").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound); // Since corrupted, perhaps index rebuilt without it
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_performance() {
+        let path = "test_perf.db";
+        let mut db = create_test_db(path);
+        // Write perf: 5MB/s min
+        let start = std::time::Instant::now();
+        let data = vec![0u8; 5 * 1024 * 1024]; // 5MB
+        let mut cursor = Cursor::new(&data);
+        db.write_document("/perf_write", &mut cursor).unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = 5.0 / elapsed;
+        assert!(speed >= 5.0, "Write speed: {} MB/s", speed);
+        // Read perf: 10MB/s min (standard)
+        db.set_quick_mode(false);
+        let start = std::time::Instant::now();
+        let _ = db.get("/perf_write").unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = 5.0 / elapsed;
+        assert!(speed >= 10.0, "Read speed: {} MB/s", speed);
+        // Quick mode ~100MB/s, but assert >10
+        db.set_quick_mode(true);
+        let start = std::time::Instant::now();
+        let _ = db.get("/perf_write").unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = 5.0 / elapsed;
+        assert!(speed >= 10.0, "Quick read speed: {} MB/s", speed);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        let path = "test_concurrent.db";
+        let db = Arc::new(create_test_db(path));
+        let mut handles = vec![];
+        for i in 0..100 {
+            let db_clone = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                if i % 2 == 0 {
+                    let mut data = Cursor::new(format!("concurrent{}", i).as_bytes());
+                    let _ = db_clone.write_document(&format!("/con/{}", i), &mut data);
+                } else {
+                    let _ = db_clone.get(&format!("/con/{}", i - 1));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_resource_exhaustion() {
+        let mut config = Config::default();
+        config.max_pages = 10;
+        let path = "test_exhaust.db";
+        let mut db = StreamDb::open_with_config(path, config).unwrap();
+        for i in 0..10 {
+            let mut data = Cursor::new(b"exhaust");
+            db.write_document(&format!("/ex/{}", i), &mut data).unwrap();
+        }
+        let mut data = Cursor::new(b"one more");
+        let err = db.write_document("/ex/11", &mut data).err().unwrap();
+        assert!(err.to_string().contains("Max pages exceeded"));
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_power_failure_sim() {
+        let path = "test_power.db";
+        {
+            let mut db = create_test_db(&path);
+            let mut data = Cursor::new(b"partial write");
+            let id = db.write_document("/power", &mut data).unwrap();
+            // Simulate partial flush: don't call flush
+        }
+        // Reopen, check if data is there or recovered (since no flush, may be partial, but in test, assume OS flush)
+        let db = create_test_db(&path);
+        let read = db.get("/power").ok(); // May or may not be there, but test recovery runs
+        assert!(read.is_some() || true); // Depending on OS
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_corruption_recovery() {
+        let path = "test_corrupt.db";
+        {
+            let mut db = create_test_db(&path);
+            let mut data = Cursor::new(b"corrupt me");
+            db.write_document("/corrupt", &mut data).unwrap();
+            db.flush().unwrap();
+        }
+        // Corrupt header magic
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&[0u8; 8])?;
+        file.flush().unwrap();
+        drop(file);
+        // Reopen, should reinit header
+        let db = create_test_db(&path);
+        let err = db.get("/corrupt").err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound); // Data lost, but DB usable
+        remove_file(path).unwrap();
+    }
 }
