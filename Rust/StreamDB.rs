@@ -1,4 +1,3 @@
-```rust
 //! StreamDb - A lightweight, embedded database for storing and retrieving binary streams via paths.
 //!
 //! ## Overview
