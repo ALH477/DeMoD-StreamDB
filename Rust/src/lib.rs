@@ -31,8 +31,7 @@
 //!   - **Recovery**: Scans orphans, repairs chains, rebuilds indexes.
 //!   - **Error Handling**: Checks bounds, CRC, versions; custom recovery.
 //!   - **Maintenance**: Flush, stats, GC, cache metrics.
-//! - **Dependencies**: uuid, crc, memmap2 (optional), byteorder, parking_lot, lru.
-//! - **Testing**: Unit, integration, stress tests for concurrency/corruption.
+//! - **Dependencies**: uuid, crc, memmap2 (optional), byteorder, parking_lot, lru, snappy, futures.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -46,17 +45,19 @@ use uuid::Uuid;
 use crc::Crc as CrcLib;
 use crc::CRC_32_ISO_HDLC;
 use lru::LruCache;
+use snappy;
+use futures::future::Future;
 
 const MAGIC: [u8; 8] = [0x55, 0xAA, 0xFE, 0xED, 0xFA, 0xCE, 0xDA, 0x7A];
-const DEFAULT_PAGE_RAW_SIZE: u64 = 4096;
+const DEFAULT_PAGE_RAW_SIZE: u64 = 8192; // CHANGED: 8KB for NVMe alignment
 const DEFAULT_PAGE_HEADER_SIZE: u64 = 32; // u32 crc (4) + i32 ver (4) + i64 prev/next (8+8) + u8 flags (1) + i32 len (4) + u8[3] pad (3) = 32 for alignment
 const FREE_LIST_HEADER_SIZE: u64 = 12; // i64 next (8) + i32 used (4)
-const FREE_LIST_ENTRIES_PER_PAGE: usize = ((DEFAULT_PAGE_RAW_SIZE - DEFAULT_PAGE_HEADER_SIZE - FREE_LIST_HEADER_SIZE) / 8) as usize; // (4096-32-12)/8 = 506
+const FREE_LIST_ENTRIES_PER_PAGE: usize = ((DEFAULT_PAGE_RAW_SIZE - DEFAULT_PAGE_HEADER_SIZE - FREE_LIST_HEADER_SIZE) / 8) as usize; // (8192-32-12)/8 = 1011
 const DEFAULT_MAX_DB_SIZE: u64 = 8000 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PAGES: i64 = i64::MAX;
 const DEFAULT_MAX_DOCUMENT_SIZE: u64 = 256 * 1024 * 1024;
 const BATCH_GROW_PAGES: u64 = 16;
-const DEFAULT_PAGE_CACHE_SIZE: usize = 1024;
+const DEFAULT_PAGE_CACHE_SIZE: usize = 2048; // CHANGED: Doubled for prefetch
 const DEFAULT_VERSIONS_TO_KEEP: i32 = 2;
 const MAX_CONSECUTIVE_EMPTY_FREE_LIST: u64 = 5; // Preemptive growth threshold
 
@@ -125,6 +126,7 @@ pub struct Config {
     page_cache_size: usize,
     versions_to_keep: i32,
     use_mmap: bool,
+    use_compression: bool, // ADDED: Toggle snappy compression
 }
 
 impl Default for Config {
@@ -138,6 +140,7 @@ impl Default for Config {
             page_cache_size: DEFAULT_PAGE_CACHE_SIZE,
             versions_to_keep: DEFAULT_VERSIONS_TO_KEEP,
             use_mmap: true,
+            use_compression: true, // ADDED: Default on
         }
     }
 }
@@ -164,6 +167,8 @@ pub trait Database {
     fn set_quick_mode(&mut self, enabled: bool);
     fn snapshot(&self) -> io::Result<Self> where Self: Sized;
     fn get_cache_stats(&self) -> io::Result<CacheStats>;
+    fn get_stream(&self, path: &str) -> io::Result<impl Iterator<Item = io::Result<Vec<u8>>>>;
+    fn get_async(&self, path: &str) -> impl Future<Output = io::Result<Vec<u8>>>;
 }
 
 pub trait DatabaseBackend {
@@ -180,6 +185,7 @@ pub trait DatabaseBackend {
     fn delete_paths_for_document(&mut self, id: Uuid) -> io::Result<()>;
     fn remove_from_index(&mut self, id: Uuid) -> io::Result<()>;
     fn get_cache_stats(&self) -> io::Result<CacheStats>;
+    fn get_stream(&self, id: Uuid) -> io::Result<impl Iterator<Item = io::Result<Vec<u8>>>>;
 }
 
 // Varint helpers for optimized serialization
@@ -460,7 +466,8 @@ impl DatabaseBackend for MemoryBackend {
         let id = Uuid::new_v4();
         let mut buf = Vec::new();
         data.read_to_end(&mut buf)?;
-        self.documents.lock().insert(id, buf);
+        let compressed = snappy::compress(&buf);
+        self.documents.lock().insert(id, compressed);
         self.id_to_paths.lock().insert(id, vec![]);
         Ok(id)
     }
@@ -477,7 +484,8 @@ impl DatabaseBackend for MemoryBackend {
             stats.misses += 1;
             return Err(io::Error::new(io::ErrorKind::NotFound, "Document not found"));
         }
-        Ok(self.documents.lock().get(&id).unwrap().clone())
+        let compressed = self.documents.lock().get(&id).unwrap().clone();
+        snappy::uncompress(&compressed)
     }
 
     fn delete_document(&mut self, id: Uuid) -> io::Result<()> {
@@ -578,6 +586,11 @@ impl DatabaseBackend for MemoryBackend {
 
     fn get_cache_stats(&self) -> io::Result<CacheStats> {
         Ok(self.cache_stats.lock().clone())
+    }
+
+    fn get_stream(&self, id: Uuid) -> io::Result<impl Iterator<Item = io::Result<Vec<u8>>>> {
+        let data = self.read_document(id)?;
+        Ok(std::iter::once(Ok(data)))
     }
 }
 
@@ -734,6 +747,9 @@ impl FileBackend {
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut data)?;
         }
+        if self.config.use_compression {
+            data = snappy::uncompress(&data)?;
+        }
         if !self.quick_mode.load(Ordering::Relaxed) {
             let computed_crc = self.compute_crc(&data);
             if computed_crc != header.crc {
@@ -742,6 +758,9 @@ impl FileBackend {
         }
         let arc_data = Arc::new(data);
         cache.put(page_id, arc_data.clone());
+        if header.next_page_id != -1 {
+            let _ = self.read_raw_page(header.next_page_id);
+        }
         Ok(arc_data)
     }
 
@@ -749,29 +768,33 @@ impl FileBackend {
         if page_id < 0 || page_id >= self.config.max_pages {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid page ID"));
         }
-        if data.len() as u64 > self.config.page_size - self.config.page_header_size {
+        let mut compressed = data.to_vec();
+        if self.config.use_compression {
+            compressed = snappy::compress(data);
+        }
+        if compressed.len() as u64 > self.config.page_size - self.config.page_header_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Data too large for page"));
         }
         let offset = page_id as u64 * self.config.page_size;
-        let crc = self.compute_crc(data);
+        let crc = self.compute_crc(&compressed);
         let header = PageHeader {
             crc,
             version,
             prev_page_id: -1,
             next_page_id: -1,
             flags: FLAG_DATA_PAGE,
-            data_length: data.len() as i32,
+            data_length: compressed.len() as i32,
             padding: [0; 3],
         };
         self.write_page_header(page_id, &header)?;
         if let Some(mmap) = self.mmap.write().as_mut() {
             let start = offset as usize + self.config.page_header_size as usize;
-            mmap[start..start + data.len()].copy_from_slice(data);
+            mmap[start..start + compressed.len()].copy_from_slice(&compressed);
             mmap.flush()?;
         } else {
             let mut file = self.file.lock();
             file.seek(SeekFrom::Start(offset + self.config.page_header_size))?;
-            file.write_all(data)?;
+            file.write_all(&compressed)?;
             file.flush()?;
         }
         self.page_cache.lock().pop(&page_id);
@@ -841,7 +864,7 @@ impl FileBackend {
         let offset = page_id as u64 * self.config.page_size + self.config.page_header_size;
         let mut buffer = Vec::new();
         let mut writer = BufWriter::new(&mut buffer);
-        writer.write_i64::<LittleEndian>(-1)?; // next_free_list_page
+        writer.write_i64::<LittleEndian>(-1)?;
         writer.write_i32::<LittleEndian>(used_entries)?;
         let data = buffer;
         if let Some(mmap) = self.mmap.write().as_mut() {
@@ -1075,7 +1098,6 @@ impl FileBackend {
 
     fn serialize_trie_node(&self, node: &ReverseTrieNode) -> io::Result<Vec<u8>> {
         let edge_bytes = node.edge.as_bytes();
-        // Estimate size: varint for edge_len (max 5) + edge + varints for parent/self (max 10 each) + u8 + Option<Uuid>(17) + varint for children_count (max 5) + children (char varint max 5 + index varint max 10)
         let estimated_size = 5 + edge_bytes.len() + 10 + 10 + 1 + 17 + 5 + node.children.len() * (5 + 10);
         if estimated_size as u64 > self.config.page_size - self.config.page_header_size {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Trie node too large"));
@@ -1164,14 +1186,12 @@ impl FileBackend {
                 let edge = child_node.edge.as_str();
                 let common_len = edge.chars().zip(remaining.chars()).take_while(|(a, b)| a == b).count();
                 if common_len == edge.len() {
-                    // Full edge match
                     path_stack.push((current_page_id, current_node));
                     current_page_id = child_page_id;
                     current_node = child_node;
                     remaining = &remaining[common_len..];
                     continue;
                 } else if common_len > 0 {
-                    // Partial match, split node
                     let common = &edge[..common_len];
                     let suffix = &edge[common_len..];
                     let new_intermediate_id = self.allocate_page()?;
@@ -1200,7 +1220,6 @@ impl FileBackend {
                     current_node = new_intermediate;
                     remaining = &remaining[common_len..];
                 } else {
-                    // No common prefix, add sibling
                     let new_child_id = self.allocate_page()?;
                     let new_child = ReverseTrieNode {
                         edge: remaining.to_string(),
@@ -1215,7 +1234,6 @@ impl FileBackend {
                     return Ok(new_child_id);
                 }
             } else {
-                // New child
                 let new_child_id = self.allocate_page()?;
                 let new_child = ReverseTrieNode {
                     edge: remaining.to_string(),
@@ -1269,7 +1287,6 @@ impl FileBackend {
         self.write_raw_page(current_page_id, &self.serialize_trie_node(&current_node)?, 1)?;
         while let Some((parent_page_id, mut parent_node, c)) = path_stack.pop() {
             if current_node.document_id.is_none() && current_node.children.len() == 1 {
-                // Merge with single child
                 let (child_char, child_page_id) = current_node.children.iter().next().unwrap();
                 let child_node = self.deserialize_trie_node(&self.read_raw_page(*child_page_id)?)?;
                 let merged_edge = format!("{}{}", current_node.edge, child_node.edge);
@@ -1350,6 +1367,28 @@ impl FileBackend {
             current_version,
             paths,
         })
+    }
+
+    fn get_stream(&self, id: Uuid) -> io::Result<impl Iterator<Item = io::Result<Vec<u8>>>> {
+        let index_root = self.document_index_root.lock();
+        let data = self.read_raw_page(index_root.page_id)?;
+        let document = self.deserialize_document(&data)?;
+        if document.id != id {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Document not found"));
+        }
+        let mut current = Some(document.first_page_id);
+        Ok(std::iter::from_fn(move || {
+            if let Some(page_id) = current {
+                let data = self.read_raw_page(page_id);
+                if let Ok(ref d) = data {
+                    let header = self.read_page_header(page_id).ok()?;
+                    current = if header.next_page_id != -1 { Some(header.next_page_id) } else { None };
+                }
+                data.map(Ok)
+            } else {
+                None
+            }
+        }))
     }
 }
 
@@ -1609,6 +1648,28 @@ impl DatabaseBackend for FileBackend {
     fn get_cache_stats(&self) -> io::Result<CacheStats> {
         Ok(self.cache_stats.lock().clone())
     }
+
+    fn get_stream(&self, id: Uuid) -> io::Result<impl Iterator<Item = io::Result<Vec<u8>>>> {
+        let index_root = self.document_index_root.lock();
+        let data = self.read_raw_page(index_root.page_id)?;
+        let document = self.deserialize_document(&data)?;
+        if document.id != id {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Document not found"));
+        }
+        let mut current = Some(document.first_page_id);
+        Ok(std::iter::from_fn(move || {
+            if let Some(page_id) = current {
+                let data = self.read_raw_page(page_id);
+                if let Ok(ref d) = data {
+                    let header = self.read_page_header(page_id).ok()?;
+                    current = if header.next_page_id != -1 { Some(header.next_page_id) } else { None };
+                }
+                data.map(Ok)
+            } else {
+                None
+            }
+        }))
+    }
 }
 
 pub struct StreamDb {
@@ -1619,8 +1680,4 @@ pub struct StreamDb {
 
 impl StreamDb {
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: Config) -> io::Result<Self> {
-        let backend = FileBackend::new(path, config)?;
-        Ok(Self {
-            backend: Box::new(backend),
-            path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(DEFAULT_PAGE_CACHE_SIZE).unwrap())),
-            quick_mode: AtomicBool::new(false),
+        let
