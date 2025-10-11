@@ -1,8 +1,8 @@
 # StreamDB
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: GPL v3](https://img.shields.io/badge/License-LGPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust Version](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
-[![Crates.io](https://img.shields.io/crates/v/streamdb.svg)](https://crates.io/crates/streamdb) <!-- Placeholder; update if published -->
+![lgpl](https://www.gnu.org/graphics/lgplv3-with-text-154x68.png)
 
 DeMoD's FOSS full implementation of Iain Ballard's incomplete C# repository. This repository was created to provide a fresh, simple GPLv3 licensing model for new users in the FOSS community. The original C# repo is under BSD; we developed a design spec based on its incomplete concepts and built a Rust implementation from scratch. **No reverse engineering of proprietary StreamDB files or systems was performed**; this is a clean-room reimplementation based solely on the public C# repository and our derived specification.
 
