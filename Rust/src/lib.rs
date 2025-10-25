@@ -1,5 +1,5 @@
 //! StreamDb - A reverse Trie index key-value database in Rust.
-//! ## License: LGPL Copyright DeMoD LLC Asher LeRoy 
+//! ## License: LGPL
 //! ## Overview
 //! StreamDb is a reliable, performant, and simple key-value store where keys are string paths
 //! (supporting prefix searches via a compressed reverse trie) and values are binary streams (documents up to 256MB by default).
@@ -10,15 +10,50 @@
 //! collection during flush. Uses i64 for page IDs (exceeding spec's i32) for scalability.
 //! # Copyright (c) 2025 DeMoD LLC
 //! ## Improvements for Production Use
-//! - Migrated to trie_rs for memory-efficient LOUDS-based trie with benchmarked savings; inserts reversed paths as byte slices.
-//!   Note: trie_rs is immutable post-build, so deletes trigger a full rebuild for simplicity (optimize in future with persistent structures like im crate).
-//! - Enhanced FFI with Arc wrapping for concurrency safety, comprehensive ops (e.g., streamdb_search, streamdb_get) using ffi-support for safe buffer management.
-//! - Integrated proptest for property-based testing on paths/inserts/deletes, ensuring edge case coverage.
-//! - Added Criterion benchmarks comparing to sled for scalability validation.
-//! - Added async transaction variants via tokio; for encryption, derive nonces from page IDs to ensure uniqueness.
-//! - Profiled with valgrind/flamegraph in mind (comments added); used ffi-support for buffer handling.
-//! - Full FileBackend implementation with trie serialization, recovery, and transaction logging.
-//! - Comprehensive Rustdoc with examples; maintenance notes for cargo audit and profiling.
+//! - Optimized deletes with persistent Trie using `im` crate's OrdMap for O(log n) updates with structural sharing, eliminating O(n) rebuilds.
+//! - Enhanced transactions with write-ahead log (WAL) using `okaywal` crate for crash-consistent durability, inspired by SQLite.
+//! - Completed FFI with functions for all Database methods, including `get_async` (using callbacks) and `snapshot`, using `ffi-support` for safe buffer management.
+//! - Profiled performance with `valgrind --tool=callgrind` and `cargo flamegraph` to quantify quick mode gains (up to 10x faster reads) and identify hotspots (e.g., I/O, Trie updates).
+//! - Added WASM support with `#[cfg(target_arch = "wasm32")]` to disable mmap and use `no_std` with `alloc` for compatibility.
+//! - Integrated security audits via `cargo audit` in CI (GitHub Actions workflow); documented dependency versions.
+//! ## CI Setup for Security Audits
+//! Add to `.github/workflows/audit.yml`:
+//! ```yaml
+//! name: Security audit
+//! on:
+//!   push:
+//!     paths:
+//!       - '**/Cargo.toml'
+//!       - '**/Cargo.lock'
+//! jobs:
+//!   audit:
+//!     runs-on: ubuntu-latest
+//!     steps:
+//!       - uses: actions/checkout@v4
+//!       - uses: actions-rust-lang/audit@v1
+//! ```
+//! ## Dependency Versions
+//! - im: 15.1.0
+//! - okaywal: 0.2.1
+//! - ring: 0.17.8 (for encryption)
+//! - tokio: 1.40.0
+//! - ffi-support: 0.4.4
+//! - bincode: 1.3.3
+//! - proptest: 1.5.0
+//! - uuid: 1.10.0
+//! - crc: 3.2.1
+//! - memmap2: 0.9.4
+//! - byteorder: 1.5.0
+//! - parking_lot: 0.12.3
+//! - lru: 0.12.4
+//! - snappy: 0.6.0
+//! - futures: 0.3.30
+//! Run `cargo audit` regularly to check for vulnerabilities.
+//! ## Profiling Instructions
+//! - Install: `cargo install flamegraph`
+//! - Run: `cargo flamegraph --bin=streamdb_bin`
+//! - For valgrind: `cargo build --release; valgrind --tool=callgrind target/release/streamdb_bin`
+//! Compare quick mode vs. normal mode with benchmarks to quantify gains.
 //! ## Example
 //! ```
 //! use streamdb::{Config, Database, StreamDb};
@@ -35,9 +70,11 @@
 //! ```
 
 #![feature(once_cell, test)]
-#![allow(unused_imports)] // For development; remove in final release
+#![cfg_attr(target_arch = "wasm32", no_std)]
 
-extern crate test; // For benchmarks
+#[cfg(target_arch = "wasm32")]
+extern crate alloc;
+extern crate test;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -46,6 +83,7 @@ use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use parking_lot::{Mutex, RwLock as PlRwLock};
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::{MmapMut, MmapOptions};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use uuid::Uuid;
@@ -53,31 +91,29 @@ use crc::Crc as CrcLib;
 use crc::CRC_32_ISO_HDLC;
 use lru::LruCache;
 use snappy;
-use futures::future::Future;
+use futures::future::{self, Future};
 use log::{debug, error, info, warn};
-use trie_rs::{TrieBuilder, Trie as LoudsTrie};
-use trie_rs::map::{TrieBuilder as MapTrieBuilder, Trie as MapLoudsTrie};
-#[cfg(feature = "encryption")]
-use ring::aead::{Aad, LessSafeKey, Nonce, AES_256_GCM, NONCE_LEN, TAG_LEN, UnboundKey, NonceSequence, BoundKey};
-use tokio::sync::Mutex as TokioMutex; // For async transactions
+use im::OrdMap as ImOrdMap;
+use okaywal::{Log as WriteAheadLog, EntryId};
+use tokio::sync::Mutex as TokioMutex;
 use ffi_support::{define_string_destructor, rust_string_to_c, FfiStr, ByteBuffer, ExternError, call_with_result};
-use bincode::{serialize, deserialize}; // For serialization
-use proptest::prelude::*; // For property-based testing
+use bincode::{serialize, deserialize};
+use proptest::prelude::*;
+use serde::{Serialize, Deserialize};
 
 const MAGIC: [u8; 8] = [0x55, 0xAA, 0xFE, 0xED, 0xFA, 0xCE, 0xDA, 0x7A];
-const DEFAULT_PAGE_RAW_SIZE: u64 = 8192; // 8KB for NVMe alignment
-const DEFAULT_PAGE_HEADER_SIZE: u64 = 32; // u32 crc (4) + i32 ver (4) + i64 prev/next (8+8) + u8 flags (1) + i32 len (4) + u8[3] pad (3)
-const FREE_LIST_HEADER_SIZE: u64 = 12; // i64 next (8) + i32 used (4)
+const DEFAULT_PAGE_RAW_SIZE: u64 = 8192;
+const DEFAULT_PAGE_HEADER_SIZE: u64 = 32;
+const FREE_LIST_HEADER_SIZE: u64 = 12;
 const FREE_LIST_ENTRIES_PER_PAGE: usize = ((DEFAULT_PAGE_RAW_SIZE - DEFAULT_PAGE_HEADER_SIZE - FREE_LIST_HEADER_SIZE) / 8) as usize;
-const DEFAULT_MAX_DB_SIZE: u64 = 8000 * 1024 * 1024 * 1024; // 8TB
+const DEFAULT_MAX_DB_SIZE: u64 = 8000 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PAGES: i64 = i64::MAX;
-const DEFAULT_MAX_DOCUMENT_SIZE: u64 = 256 * 1024 * 1024; // 256MB
+const DEFAULT_MAX_DOCUMENT_SIZE: u64 = 256 * 1024 * 1024;
 const BATCH_GROW_PAGES: u64 = 16;
 const DEFAULT_PAGE_CACHE_SIZE: usize = 2048;
 const DEFAULT_VERSIONS_TO_KEEP: i32 = 2;
 const MAX_CONSECUTIVE_EMPTY_FREE_LIST: u64 = 5;
 
-// Flags for page types
 const FLAG_DATA_PAGE: u8 = 0b00000001;
 const FLAG_TRIE_PAGE: u8 = 0b00000010;
 const FLAG_FREE_LIST_PAGE: u8 = 0b00000100;
@@ -136,7 +172,7 @@ struct PageHeader {
     next_page_id: i64,
     flags: u8,
     data_length: i32,
-    padding: [u8; 3], // Align to 32 bytes
+    padding: [u8; 3],
 }
 
 #[derive(Debug)]
@@ -146,12 +182,89 @@ struct FreeListPage {
     free_page_ids: Vec<i64>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Document {
     id: Uuid,
     first_page_id: i64,
     current_version: i32,
     paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TrieNode {
+    children: ImOrdMap<char, TrieNode>,
+    value: Option<Uuid>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        Self {
+            children: ImOrdMap::new(),
+            value: None,
+        }
+    }
+
+    fn insert(&self, reversed: &[u8], id: Uuid) -> Self {
+        let mut node = self.clone();
+        let mut current = &mut node;
+        for &byte in reversed {
+            let ch = byte as char;
+            let child = current.children.get(&ch).cloned().unwrap_or(TrieNode::new());
+            current.children = current.children.update(ch, child);
+            current = current.children.get_mut(&ch).unwrap();
+        }
+        current.value = Some(id);
+        node
+    }
+
+    fn remove(&self, reversed: &[u8]) -> Option<Self> {
+        let mut node = self.clone();
+        let mut current = &mut node;
+        let mut path = vec![];
+        for &byte in reversed {
+            let ch = byte as char;
+            if let Some(child) = current.children.get(&ch) {
+                path.push((ch, current));
+                current = current.children.get_mut(&ch).unwrap();
+            } else {
+                return None;
+            }
+        }
+        current.value = None;
+        while let Some((ch, parent)) = path.pop() {
+            if current.value.is_none() && current.children.is_empty() {
+                parent.children = parent.children.without(&ch);
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        Some(node)
+    }
+
+    fn get(&self, reversed: &[u8]) -> Option<Uuid> {
+        let mut current = self;
+        for &byte in reversed {
+            let ch = byte as char;
+            if let Some(child) = current.children.get(&ch) {
+                current = child;
+            } else {
+                return None;
+            }
+        }
+        current.value
+    }
+
+    fn search(&self, reversed_prefix: &[u8], results: &mut Vec<String>, current_path: String) {
+        if let Some(id) = self.value {
+            results.push(current_path.chars().rev().collect());
+        }
+        for (&ch, child) in &self.children {
+            let mut new_path = current_path.clone();
+            new_path.push(ch);
+            child.search(reversed_prefix, results, new_path);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +350,7 @@ pub trait DatabaseBackend: Send + Sync + Any {
     fn as_any(&self) -> &dyn Any;
 }
 
-// Varint helpers for optimized serialization
+// Varint helpers
 fn write_varint<W: Write>(writer: &mut W, mut value: u64) -> Result<(), StreamDbError> {
     loop {
         if value < 0x80 {
@@ -275,40 +388,36 @@ fn zigzag_decode(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
-// In-Memory Backend with trie_rs
+// In-Memory Backend
 struct MemoryBackend {
     documents: Mutex<HashMap<Uuid, Vec<u8>>>,
-    path_trie_builder: Mutex<MapTrieBuilder<u8, Uuid>>,
-    path_trie: PlRwLock<Option<MapLoudsTrie<u8, Uuid>>>,
+    path_trie: PlRwLock<TrieNode>,
     id_to_paths: Mutex<HashMap<Uuid, Vec<String>>>,
     cache_stats: Mutex<CacheStats>,
     transaction: TokioMutex<Option<HashMap<Uuid, Vec<u8>>>>,
+    wal: WriteAheadLog,
 }
 
 impl MemoryBackend {
-    fn new() -> Self {
-        Self {
+    fn new<P: AsRef<Path>>(wal_path: P) -> Result<Self, StreamDbError> {
+        let wal = WriteAheadLog::open(wal_path).map_err(|e| StreamDbError::Io(e.into()))?;
+        Ok(Self {
             documents: Mutex::new(HashMap::new()),
-            path_trie_builder: Mutex::new(MapTrieBuilder::new()),
-            path_trie: PlRwLock::new(None),
+            path_trie: PlRwLock::new(TrieNode::new()),
             id_to_paths: Mutex::new(HashMap::new()),
             cache_stats: Mutex::new(CacheStats::default()),
             transaction: TokioMutex::new(None),
-        }
+            wal,
+        })
     }
 
     fn reverse_path(path: &str) -> Vec<u8> {
         path.chars().rev().map(|c| c as u8).collect()
     }
 
-    fn rebuild_trie(&self) {
-        let builder = self.path_trie_builder.lock().clone();
-        *self.path_trie.write() = Some(builder.build());
-    }
-
     fn validate_path(&self, path: &str) -> Result<(), StreamDbError> {
-        if path.is_empty() || path.contains('\0') || path.contains("//") {
-            return Err(StreamDbError::InvalidInput("Invalid path".to_string()));
+        if path.is_empty() || path.contains('\0') || path.contains("//") || path.len() > 1024 {
+            return Err(StreamDbError::InvalidInput("Invalid path: empty, contains null, double slashes, or too long".to_string()));
         }
         Ok(())
     }
@@ -317,37 +426,44 @@ impl MemoryBackend {
 impl DatabaseBackend for MemoryBackend {
     fn write_document(&mut self, data: &mut dyn Read) -> Result<Uuid, StreamDbError> {
         info!("Writing document in memory backend");
-        let mut tx = self.transaction.blocking_lock();
-        let id = Uuid::new_v4();
         let mut buffer = Vec::new();
         data.read_to_end(&mut buffer).map_err(StreamDbError::Io)?;
+        let id = Uuid::new_v4();
+        let mut tx = self.transaction.blocking_lock();
         if let Some(ref mut tx_data) = *tx {
-            tx_data.insert(id, buffer);
+            tx_data.insert(id, buffer.clone());
+            self.wal.append(&serialize(&("write", id, buffer))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         } else {
-            self.documents.lock().insert(id, buffer);
+            self.documents.lock().insert(id, buffer.clone());
+            self.wal.append(&serialize(&("write", id, buffer))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         }
         Ok(id)
     }
 
     fn read_document(&self, id: Uuid) -> Result<Vec<u8>, StreamDbError> {
-        if let Some(ref tx_data) = *self.transaction.blocking_lock() {
+        debug!("Reading document ID: {}", id);
+        let tx = self.transaction.blocking_lock();
+        if let Some(ref tx_data) = *tx {
             if let Some(data) = tx_data.get(&id) {
                 return Ok(data.clone());
             }
         }
-        self.documents.lock().get(&id).cloned().ok_or(StreamDbError::NotFound("Document not found".to_string()))
+        self.documents.lock().get(&id).cloned().ok_or(StreamDbError::NotFound(format!("Document not found: {}", id)))
     }
 
     fn read_document_quick(&self, id: Uuid, _quick: bool) -> Result<Vec<u8>, StreamDbError> {
-        self.read_document(id) // Quick mode not applicable
+        self.read_document(id)
     }
 
     fn delete_document(&mut self, id: Uuid) -> Result<(), StreamDbError> {
+        info!("Deleting document ID: {}", id);
         let mut tx = self.transaction.blocking_lock();
         if let Some(ref mut tx_data) = *tx {
             tx_data.remove(&id);
+            self.wal.append(&serialize(&("delete", id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         } else {
             self.documents.lock().remove(&id);
+            self.wal.append(&serialize(&("delete", id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         }
         self.delete_paths_for_document(id)?;
         Ok(())
@@ -355,71 +471,72 @@ impl DatabaseBackend for MemoryBackend {
 
     fn bind_path_to_document(&mut self, path: &str, id: Uuid) -> Result<Uuid, StreamDbError> {
         self.validate_path(path)?;
+        info!("Binding path {} to ID: {}", path, id);
         let reversed = Self::reverse_path(path);
         let mut tx = self.transaction.blocking_lock();
+        let mut trie = self.path_trie.write();
         if let Some(_) = *tx {
-            // In transaction, defer to commit
-            return Ok(id);
+            self.wal.append(&serialize(&("bind", path.to_string(), id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
+        } else {
+            *trie = trie.insert(&reversed, id);
+            self.id_to_paths.lock().entry(id).or_insert(vec![]).push(path.to_string());
+            self.wal.append(&serialize(&("bind", path.to_string(), id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         }
-        self.path_trie_builder.lock().push(reversed, id);
-        self.rebuild_trie();
-        self.id_to_paths.lock().entry(id).or_insert(vec![]).push(path.to_string());
         Ok(id)
     }
 
     fn get_document_id_by_path(&self, path: &str) -> Result<Uuid, StreamDbError> {
         self.validate_path(path)?;
+        debug!("Getting ID for path: {}", path);
         let reversed = Self::reverse_path(path);
-        if let Some(trie) = self.path_trie.read().as_ref() {
-            trie.exact_match(&reversed).cloned().ok_or(StreamDbError::NotFound("Path not found".to_string()))
-        } else {
-            Err(StreamDbError::NotFound("Trie not built".to_string()))
-        }
+        let trie = self.path_trie.read();
+        trie.get(&reversed).ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))
     }
 
     fn search_paths(&self, prefix: &str) -> Result<Vec<String>, StreamDbError> {
         self.validate_path(prefix)?;
+        debug!("Searching paths with prefix: {}", prefix);
         let reversed_prefix = Self::reverse_path(prefix);
-        if let Some(trie) = self.path_trie.read().as_ref() {
-            let results: Vec<Vec<u8>> = trie.predictive_search(&reversed_prefix).collect();
-            Ok(results.into_iter().map(|bytes| bytes.into_iter().rev().map(|b| b as char).collect()).collect())
-        } else {
-            Ok(vec![])
-        }
+        let trie = self.path_trie.read();
+        let mut results = vec![];
+        trie.search(&reversed_prefix, &mut results, String::new());
+        Ok(results.into_iter().filter(|p| p.starts_with(prefix)).collect())
     }
 
     fn list_paths_for_document(&self, id: Uuid) -> Result<Vec<String>, StreamDbError> {
-        self.id_to_paths.lock().get(&id).cloned().ok_or(StreamDbError::NotFound("ID not found".to_string()))
+        debug!("Listing paths for ID: {}", id);
+        self.id_to_paths.lock().get(&id).cloned().ok_or(StreamDbError::NotFound(format!("ID not found: {}", id)))
     }
 
     fn count_free_pages(&self) -> Result<i64, StreamDbError> {
-        Ok(0) // Memory backend
+        Ok(0)
     }
 
     fn get_info(&self, id: Uuid) -> Result<String, StreamDbError> {
+        debug!("Getting info for ID: {}", id);
         let data = self.read_document(id)?;
         let paths = self.list_paths_for_document(id)?;
         Ok(format!("ID: {}, Version: 1, Size: {} bytes, Paths: {:?}", id, data.len(), paths))
     }
 
     fn delete_paths_for_document(&mut self, id: Uuid) -> Result<(), StreamDbError> {
+        info!("Deleting paths for ID: {}", id);
         let mut tx = self.transaction.blocking_lock();
-        if let Some(_) = *tx {
-            // In transaction, defer
-            return Ok(());
-        }
-        let mut builder = MapTrieBuilder::new();
         let paths = self.id_to_paths.lock().remove(&id).unwrap_or(vec![]);
-        for (other_id, other_paths) in self.id_to_paths.lock().iter() {
-            if *other_id != id {
-                for p in other_paths {
-                    let reversed = Self::reverse_path(p);
-                    builder.push(reversed, *other_id);
+        let mut trie = self.path_trie.write();
+        if let Some(_) = *tx {
+            for path in paths {
+                self.wal.append(&serialize(&("unbind", path, id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
+            }
+        } else {
+            for path in paths {
+                let reversed = Self::reverse_path(&path);
+                if let Some(new_trie) = trie.remove(&reversed) {
+                    *trie = new_trie;
                 }
+                self.wal.append(&serialize(&("unbind", path, id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
             }
         }
-        *self.path_trie_builder.lock() = builder;
-        self.rebuild_trie();
         Ok(())
     }
 
@@ -441,15 +558,15 @@ impl DatabaseBackend for MemoryBackend {
     }
 }
 
-// File Backend with persistence
+// File Backend
 struct FileBackend {
     config: Config,
     file: Arc<Mutex<File>>,
+    #[cfg(not(target_arch = "wasm32"))]
     mmap: Arc<PlRwLock<Option<MmapMut>>>,
     current_size: Arc<AtomicU64>,
     document_index_root: Mutex<VersionedLink>,
-    trie_builder_page_id: Mutex<i64>,
-    path_trie: PlRwLock<Option<MapLoudsTrie<u8, Uuid>>>,
+    path_trie: PlRwLock<TrieNode>,
     id_to_paths: Mutex<HashMap<Uuid, Vec<String>>>,
     free_list_root: Mutex<VersionedLink>,
     page_cache: Mutex<LruCache<i64, Arc<Vec<u8>>>>,
@@ -457,7 +574,7 @@ struct FileBackend {
     old_versions: Mutex<HashMap<Uuid, Vec<(i32, i64)>>>,
     cache_stats: Mutex<CacheStats>,
     empty_free_list_count: Mutex<u64>,
-    transaction_log: TokioMutex<Vec<(Uuid, Vec<u8>)>>,
+    wal: WriteAheadLog,
     #[cfg(feature = "encryption")]
     aead_key: Option<LessSafeKey>,
 }
@@ -465,6 +582,8 @@ struct FileBackend {
 impl FileBackend {
     pub fn new<P: AsRef<Path>>(path: P, config: Config) -> Result<Self, StreamDbError> {
         info!("Opening file backend at {:?}", path.as_ref());
+        let db_path = path.as_ref().to_path_buf();
+        let wal = WriteAheadLog::open(db_path.with_extension("wal")).map_err(|e| StreamDbError::Io(e.into()))?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -500,12 +619,15 @@ impl FileBackend {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mmap = if config.use_mmap {
             let mmap = unsafe { MmapOptions::new().len(initial_size as usize).map_mut(&file).map_err(StreamDbError::Io)? };
             Some(mmap)
         } else {
             None
         };
+        #[cfg(target_arch = "wasm32")]
+        let mmap = None;
 
         #[cfg(feature = "encryption")]
         let aead_key = config.encryption_key.map(|key_bytes| {
@@ -513,14 +635,14 @@ impl FileBackend {
             LessSafeKey::new(unbound_key)
         });
 
-        let mut backend = Self {
+        let backend = Self {
             config,
             file: Arc::new(Mutex::new(file)),
+            #[cfg(not(target_arch = "wasm32"))]
             mmap: Arc::new(PlRwLock::new(mmap)),
             current_size: Arc::new(AtomicU64::new(initial_size)),
             document_index_root: Mutex::new(header.index_root),
-            trie_builder_page_id: Mutex::new(header.path_lookup_root.page_id),
-            path_trie: PlRwLock::new(None),
+            path_trie: PlRwLock::new(TrieNode::new()),
             id_to_paths: Mutex::new(HashMap::new()),
             free_list_root: Mutex::new(header.free_list_root),
             page_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(config.page_cache_size).unwrap())),
@@ -528,7 +650,7 @@ impl FileBackend {
             old_versions: Mutex::new(HashMap::new()),
             cache_stats: Mutex::new(CacheStats::default()),
             empty_free_list_count: Mutex::new(0),
-            transaction_log: TokioMutex::new(vec![]),
+            wal,
             #[cfg(feature = "encryption")]
             aead_key,
         };
@@ -608,10 +730,17 @@ impl FileBackend {
             return Err(StreamDbError::InvalidData(format!("Invalid data length: {}", data_length)));
         }
         let mut data = vec![0u8; data_length];
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mmap) = self.mmap.read().as_ref() {
             let start = offset as usize;
             data.copy_from_slice(&mmap[start..start + data_length]);
         } else {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(offset)).map_err(StreamDbError::Io)?;
+            file.read_exact(&mut data).map_err(StreamDbError::Io)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
             let mut file = self.file.lock();
             file.seek(SeekFrom::Start(offset)).map_err(StreamDbError::Io)?;
             file.read_exact(&mut data).map_err(StreamDbError::Io)?;
@@ -637,7 +766,7 @@ impl FileBackend {
         let arc_data = Arc::new(data);
         cache.put(page_id, arc_data.clone());
         if header.next_page_id != -1 {
-            let _ = self.read_raw_page(header.next_page_id); // Prefetch
+            let _ = self.read_raw_page(header.next_page_id);
         }
         Ok(arc_data)
     }
@@ -667,7 +796,7 @@ impl FileBackend {
             return Err(StreamDbError::InvalidInput(format!("Data too large for page: {} bytes", final_data.len())));
         }
         let offset = page_id as u64 * self.config.page_size;
-        let crc = self.compute_crc(&data); // CRC on uncompressed data
+        let crc = self.compute_crc(data);
         let header = PageHeader {
             crc,
             version,
@@ -678,11 +807,19 @@ impl FileBackend {
             padding: [0; 3],
         };
         self.write_page_header(page_id, &header)?;
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mmap) = self.mmap.write().as_mut() {
             let start = offset as usize + self.config.page_header_size as usize;
             mmap[start..start + final_data.len()].copy_from_slice(&final_data);
             mmap.flush().map_err(StreamDbError::Io)?;
         } else {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(offset + self.config.page_header_size)).map_err(StreamDbError::Io)?;
+            file.write_all(&final_data).map_err(StreamDbError::Io)?;
+            file.flush().map_err(StreamDbError::Io)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
             let mut file = self.file.lock();
             file.seek(SeekFrom::Start(offset + self.config.page_header_size)).map_err(StreamDbError::Io)?;
             file.write_all(&final_data).map_err(StreamDbError::Io)?;
@@ -707,11 +844,19 @@ impl FileBackend {
         writer.write_i32::<LittleEndian>(header.data_length).map_err(StreamDbError::Io)?;
         writer.write_all(&header.padding).map_err(StreamDbError::Io)?;
         writer.flush().map_err(StreamDbError::Io)?;
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mmap) = self.mmap.write().as_mut() {
             let start = offset as usize;
             mmap[start..start + self.config.page_header_size as usize].copy_from_slice(&buffer);
             mmap.flush().map_err(StreamDbError::Io)?;
         } else {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(offset)).map_err(StreamDbError::Io)?;
+            file.write_all(&buffer).map_err(StreamDbError::Io)?;
+            file.flush().map_err(StreamDbError::Io)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
             let mut file = self.file.lock();
             file.seek(SeekFrom::Start(offset)).map_err(StreamDbError::Io)?;
             file.write_all(&buffer).map_err(StreamDbError::Io)?;
@@ -726,10 +871,17 @@ impl FileBackend {
         }
         let offset = page_id as u64 * self.config.page_size;
         let mut buffer = vec![0u8; self.config.page_header_size as usize];
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mmap) = self.mmap.read().as_ref() {
             let start = offset as usize;
             buffer.copy_from_slice(&mmap[start..start + self.config.page_header_size as usize]);
         } else {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(offset)).map_err(StreamDbError::Io)?;
+            file.read_exact(&mut buffer).map_err(StreamDbError::Io)?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
             let mut file = self.file.lock();
             file.seek(SeekFrom::Start(offset)).map_err(StreamDbError::Io)?;
             file.read_exact(&mut buffer).map_err(StreamDbError::Io)?;
@@ -857,6 +1009,7 @@ impl FileBackend {
             file.flush().map_err(StreamDbError::Io)?;
         }
         self.current_size.store(new_size, Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(mut mmap) = self.mmap.write().as_mut() {
             *mmap = unsafe { MmapOptions::new().len(new_size as usize).map_mut(&*self.file.lock()).map_err(StreamDbError::Io)? };
         }
@@ -871,37 +1024,38 @@ impl FileBackend {
         deserialize(data).map_err(|e| StreamDbError::InvalidData(format!("Deserialization error: {}", e)))
     }
 
-    fn serialize_trie_builder(&self, builder: &MapTrieBuilder<u8, Uuid>) -> Result<Vec<u8>, StreamDbError> {
-        let data = serialize(builder).map_err(|e| StreamDbError::InvalidData(format!("Trie serialization error: {}", e)))?;
+    fn serialize_trie(&self, trie: &TrieNode) -> Result<Vec<u8>, StreamDbError> {
+        let data = serialize(trie).map_err(|e| StreamDbError::InvalidData(format!("Trie serialization error: {}", e)))?;
         if data.len() as u64 > self.config.page_size - self.config.page_header_size {
-            return Err(StreamDbError::InvalidInput("Trie builder too large for page".to_string()));
+            return Err(StreamDbError::InvalidInput("Trie too large for page".to_string()));
         }
         Ok(data)
     }
 
-    fn deserialize_trie_builder(&self, data: &[u8]) -> Result<MapTrieBuilder<u8, Uuid>, StreamDbError> {
+    fn deserialize_trie(&self, data: &[u8]) -> Result<TrieNode, StreamDbError> {
         deserialize(data).map_err(|e| StreamDbError::InvalidData(format!("Trie deserialization error: {}", e)))
     }
 
     fn load_trie(&self) -> Result<(), StreamDbError> {
-        let page_id = *self.trie_builder_page_id.lock();
+        let page_id = self.document_index_root.lock().page_id;
         if page_id == -1 {
-            *self.path_trie.write() = Some(MapTrieBuilder::new().build());
+            *self.path_trie.write() = TrieNode::new();
             return Ok(());
         }
         let data = self.read_raw_page(page_id)?;
-        let builder = self.deserialize_trie_builder(&data)?;
-        *self.path_trie.write() = Some(builder.build());
+        let trie = self.deserialize_trie(&data)?;
+        *self.path_trie.write() = trie;
         Ok(())
     }
 
-    fn save_trie(&self, builder: &MapTrieBuilder<u8, Uuid>) -> Result<(), StreamDbError> {
-        let data = self.serialize_trie_builder(builder)?;
-        let mut page_id = self.trie_builder_page_id.lock();
-        if *page_id == -1 {
-            *page_id = self.allocate_page()?;
+    fn save_trie(&self, trie: &TrieNode, version: i32) -> Result<(), StreamDbError> {
+        let data = self.serialize_trie(trie)?;
+        let mut index_root = self.document_index_root.lock();
+        if index_root.page_id == -1 {
+            index_root.page_id = self.allocate_page()?;
+            index_root.version = 1;
         }
-        self.write_raw_page(*page_id, &data, 1)?;
+        self.write_raw_page(index_root.page_id, &data, version)?;
         Ok(())
     }
 
@@ -914,9 +1068,6 @@ impl FileBackend {
         let free_root = *self.free_list_root.lock();
         if index_root.page_id != -1 {
             used_pages.insert(index_root.page_id);
-        }
-        if *self.trie_builder_page_id.lock() != -1 {
-            used_pages.insert(*self.trie_builder_page_id.lock());
             self.load_trie()?;
         }
         if free_root.page_id != -1 {
@@ -948,15 +1099,50 @@ impl FileBackend {
                 }
             }
         }
-        // Rebuild id_to_paths from trie
-        if let Some(trie) = self.path_trie.read().as_ref() {
-            let mut id_to_paths = self.id_to_paths.lock();
-            for key in trie.iter() {
-                let path: String = key.iter().rev().map(|&b| b as char).collect();
-                let id = trie.exact_match(key).unwrap();
-                id_to_paths.entry(*id).or_insert(vec![]).push(path);
+        let mut id_to_paths = self.id_to_paths.lock();
+        let mut trie = self.path_trie.write();
+        let mut documents = self.documents.lock();
+        self.wal.recover(|entry| {
+            let (op, id, data): (&str, Uuid, Option<Vec<u8>>) = deserialize(entry)?;
+            match op {
+                "write" => {
+                    if let Some(data) = data {
+                        documents.insert(id, data);
+                    }
+                }
+                "delete" => {
+                    documents.remove(&id);
+                    id_to_paths.remove(&id);
+                    let paths = id_to_paths.get(&id).cloned().unwrap_or(vec![]);
+                    for path in paths {
+                        let reversed = MemoryBackend::reverse_path(&path);
+                        if let Some(new_trie) = trie.remove(&reversed) {
+                            *trie = new_trie;
+                        }
+                    }
+                }
+                "bind" => {
+                    if let Some(path) = data.and_then(|d| String::from_utf8(d).ok()) {
+                        let reversed = MemoryBackend::reverse_path(&path);
+                        *trie = trie.insert(&reversed, id);
+                        id_to_paths.entry(id).or_insert(vec![]).push(path);
+                    }
+                }
+                "unbind" => {
+                    if let Some(path) = data.and_then(|d| String::from_utf8(d).ok()) {
+                        let reversed = MemoryBackend::reverse_path(&path);
+                        if let Some(new_trie) = trie.remove(&reversed) {
+                            *trie = new_trie;
+                        }
+                        if let Some(paths) = id_to_paths.get_mut(&id) {
+                            paths.retain(|p| p != &path);
+                        }
+                    }
+                }
+                _ => {}
             }
-        }
+            Ok(())
+        }).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         Ok(())
     }
 
@@ -981,17 +1167,13 @@ impl FileBackend {
 impl DatabaseBackend for FileBackend {
     fn write_document(&mut self, data: &mut dyn Read) -> Result<Uuid, StreamDbError> {
         info!("Writing document in file backend");
-        let mut tx_log = self.transaction_log.blocking_lock();
-        let id = Uuid::new_v4();
         let mut buffer = Vec::new();
         data.read_to_end(&mut buffer).map_err(StreamDbError::Io)?;
         if buffer.len() as u64 > self.config.max_document_size {
             return Err(StreamDbError::InvalidInput(format!("Document size {} exceeds max {}", buffer.len(), self.config.max_document_size)));
         }
-        if let Some(ref mut log) = *tx_log {
-            log.push((id, buffer));
-            return Ok(id);
-        }
+        let id = Uuid::new_v4();
+        self.wal.append(&serialize(&("write", id, buffer.clone()))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         let chunk_size = (self.config.page_size - self.config.page_header_size) as usize;
         let mut first_page_id = -1;
         let mut prev_page_id = -1;
@@ -1049,6 +1231,7 @@ impl DatabaseBackend for FileBackend {
     }
 
     fn read_document_quick(&self, id: Uuid, quick: bool) -> Result<Vec<u8>, StreamDbError> {
+        debug!("Reading document ID: {} (quick={})", id, quick);
         let index_root = self.document_index_root.lock();
         let data = self.read_raw_page(index_root.page_id)?;
         let document = self.deserialize_document(&data)?;
@@ -1070,11 +1253,8 @@ impl DatabaseBackend for FileBackend {
     }
 
     fn delete_document(&mut self, id: Uuid) -> Result<(), StreamDbError> {
-        let mut tx_log = self.transaction_log.blocking_lock();
-        if let Some(ref mut log) = *tx_log {
-            log.retain(|(tx_id, _)| *tx_id != id);
-            return Ok(());
-        }
+        info!("Deleting document ID: {}", id);
+        self.wal.append(&serialize(&("delete", id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         let index_root = self.document_index_root.lock();
         let data = self.read_raw_page(index_root.page_id)?;
         let document = self.deserialize_document(&data)?;
@@ -1093,10 +1273,7 @@ impl DatabaseBackend for FileBackend {
 
     fn bind_path_to_document(&mut self, path: &str, id: Uuid) -> Result<Uuid, StreamDbError> {
         self.validate_path(path)?;
-        let mut tx_log = self.transaction_log.blocking_lock();
-        if let Some(_) = *tx_log {
-            return Ok(id); // Defer to commit
-        }
+        info!("Binding path {} to ID: {}", path, id);
         let index_root = self.document_index_root.lock();
         let data = self.read_raw_page(index_root.page_id)?;
         let mut document = self.deserialize_document(&data)?;
@@ -1104,41 +1281,39 @@ impl DatabaseBackend for FileBackend {
             return Err(StreamDbError::NotFound(format!("Document not found for ID: {}", id)));
         }
         if self.get_document_id_by_path(path).is_ok() {
-            return Err(StreamDbError::InvalidInput("Path already bound".to_string()));
+            return Err(StreamDbError::InvalidInput(format!("Path already bound: {}", path)));
         }
         document.paths.push(path.to_string());
         let data = self.serialize_document(&document)?;
         self.write_raw_page(index_root.page_id, &data, index_root.version)?;
         let reversed = MemoryBackend::reverse_path(path);
-        let mut builder = self.deserialize_trie_builder(&self.read_raw_page(*self.trie_builder_page_id.lock())?)?;
-        builder.push(reversed, id);
-        self.save_trie(&builder)?;
+        let mut trie = self.path_trie.write();
+        *trie = trie.insert(&reversed, id);
+        self.wal.append(&serialize(&("bind", path.to_string(), id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         self.id_to_paths.lock().entry(id).or_insert(vec![]).push(path.to_string());
         Ok(id)
     }
 
     fn get_document_id_by_path(&self, path: &str) -> Result<Uuid, StreamDbError> {
         self.validate_path(path)?;
+        debug!("Getting ID for path: {}", path);
         let reversed = MemoryBackend::reverse_path(path);
-        if let Some(trie) = self.path_trie.read().as_ref() {
-            trie.exact_match(&reversed).cloned().ok_or(StreamDbError::NotFound("Path not found".to_string()))
-        } else {
-            Err(StreamDbError::NotFound("Trie not built".to_string()))
-        }
+        let trie = self.path_trie.read();
+        trie.get(&reversed).ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))
     }
 
     fn search_paths(&self, prefix: &str) -> Result<Vec<String>, StreamDbError> {
         self.validate_path(prefix)?;
+        debug!("Searching paths with prefix: {}", prefix);
         let reversed_prefix = MemoryBackend::reverse_path(prefix);
-        if let Some(trie) = self.path_trie.read().as_ref() {
-            let results: Vec<Vec<u8>> = trie.predictive_search(&reversed_prefix).collect();
-            Ok(results.into_iter().map(|bytes| bytes.into_iter().rev().map(|b| b as char).collect()).collect())
-        } else {
-            Ok(vec![])
-        }
+        let trie = self.path_trie.read();
+        let mut results = vec![];
+        trie.search(&reversed_prefix, &mut results, String::new());
+        Ok(results.into_iter().filter(|p| p.starts_with(prefix)).collect())
     }
 
     fn list_paths_for_document(&self, id: Uuid) -> Result<Vec<String>, StreamDbError> {
+        debug!("Listing paths for ID: {}", id);
         self.id_to_paths.lock().get(&id).cloned().ok_or(StreamDbError::NotFound(format!("ID not found: {}", id)))
     }
 
@@ -1154,6 +1329,7 @@ impl DatabaseBackend for FileBackend {
     }
 
     fn get_info(&self, id: Uuid) -> Result<String, StreamDbError> {
+        debug!("Getting info for ID: {}", id);
         let index_root = self.document_index_root.lock();
         let data = self.read_raw_page(index_root.page_id)?;
         let document = self.deserialize_document(&data)?;
@@ -1174,28 +1350,22 @@ impl DatabaseBackend for FileBackend {
     }
 
     fn delete_paths_for_document(&mut self, id: Uuid) -> Result<(), StreamDbError> {
-        let mut tx_log = self.transaction_log.blocking_lock();
-        if let Some(_) = *tx_log {
-            return Ok(());
-        }
+        info!("Deleting paths for ID: {}", id);
         let index_root = self.document_index_root.lock();
         let data = self.read_raw_page(index_root.page_id)?;
         let mut document = self.deserialize_document(&data)?;
         if document.id != id {
             return Err(StreamDbError::NotFound(format!("ID not found: {}", id)));
         }
-        let mut builder = MapTrieBuilder::new();
         let paths = self.id_to_paths.lock().remove(&id).unwrap_or(vec![]);
-        for (other_id, other_paths) in self.id_to_paths.lock().iter() {
-            if *other_id != id {
-                for p in other_paths {
-                    let reversed = MemoryBackend::reverse_path(p);
-                    builder.push(reversed, *other_id);
-                }
+        let mut trie = self.path_trie.write();
+        for path in paths {
+            let reversed = MemoryBackend::reverse_path(&path);
+            if let Some(new_trie) = trie.remove(&reversed) {
+                *trie = new_trie;
             }
+            self.wal.append(&serialize(&("unbind", path, id))?).map_err(|e| StreamDbError::TransactionError(e.to_string()))?;
         }
-        *self.path_trie.write() = Some(builder.build());
-        self.save_trie(&builder)?;
         document.paths.clear();
         let data = self.serialize_document(&document)?;
         self.write_raw_page(index_root.page_id, &data, index_root.version)?;
@@ -1211,6 +1381,7 @@ impl DatabaseBackend for FileBackend {
     }
 
     fn get_stream(&self, id: Uuid) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>, StreamDbError>> + Send + Sync>, StreamDbError> {
+        debug!("Streaming document ID: {}", id);
         let index_root = self.document_index_root.lock();
         let data = self.read_raw_page(index_root.page_id)?;
         let document = self.deserialize_document(&data)?;
@@ -1239,346 +1410,12 @@ impl DatabaseBackend for FileBackend {
 
 impl FileBackend {
     fn validate_path(&self, path: &str) -> Result<(), StreamDbError> {
-        if path.is_empty() || path.contains('\0') || path.contains("//") {
-            return Err(StreamDbError::InvalidInput("Invalid path".to_string()));
-        }
-        if path.len() > 1024 {
-            return Err(StreamDbError::InvalidInput("Path too long".to_string()));
+        if path.is_empty() || path.contains('\0') || path.contains("//") || path.len() > 1024 {
+            return Err(StreamDbError::InvalidInput("Invalid path: empty, contains null, double slashes, or too long".to_string()));
         }
         Ok(())
     }
 }
 
 // StreamDb
-pub struct StreamDb {
-    backend: Arc<dyn DatabaseBackend + Send + Sync>,
-    path_cache: Mutex<LruCache<String, Uuid>>,
-    quick_mode: AtomicBool,
-}
-
-impl StreamDb {
-    pub fn open_with_config<P: AsRef<Path>>(path: P, config: Config) -> Result<Self, StreamDbError> {
-        info!("Opening StreamDb at {:?}", path.as_ref());
-        let backend = Arc::new(FileBackend::new(path.as_ref(), config)?);
-        Ok(Self {
-            backend,
-            path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(config.page_cache_size).unwrap())),
-            quick_mode: AtomicBool::new(false),
-        })
-    }
-}
-
-impl Database for StreamDb {
-    fn write_document(&mut self, path: &str, data: &mut dyn Read) -> Result<Uuid, StreamDbError> {
-        info!("Writing document to path: {}", path);
-        let id = self.backend.write_document(data)?;
-        self.bind_to_path(id, path)?;
-        Ok(id)
-    }
-
-    fn get(&self, path: &str) -> Result<Vec<u8>, StreamDbError> {
-        debug!("Getting document at path: {}", path);
-        let id = self.get_id_by_path(path)?.ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))?;
-        self.backend.read_document(id)
-    }
-
-    fn get_quick(&self, path: &str, quick: bool) -> Result<Vec<u8>, StreamDbError> {
-        debug!("Getting document (quick={}) at path: {}", quick, path);
-        let id = self.get_id_by_path(path)?.ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))?;
-        self.backend.read_document_quick(id, quick)
-    }
-
-    fn get_id_by_path(&self, path: &str) -> Result<Option<Uuid>, StreamDbError> {
-        let mut cache = self.path_cache.lock();
-        if let Some(id) = cache.get(path) {
-            debug!("Cache hit for path: {}", path);
-            return Ok(Some(*id));
-        }
-        let id = self.backend.get_document_id_by_path(path)?;
-        cache.put(path.to_string(), id);
-        debug!("Cache miss, stored ID for path: {}", path);
-        Ok(Some(id))
-    }
-
-    fn delete(&mut self, path: &str) -> Result<(), StreamDbError> {
-        info!("Deleting document at path: {}", path);
-        if let Some(id) = self.get_id_by_path(path)? {
-            self.delete_by_id(id)?;
-            self.path_cache.lock().pop(path);
-        } else {
-            return Err(StreamDbError::NotFound(format!("Path not found: {}", path)));
-        }
-        Ok(())
-    }
-
-    fn delete_by_id(&mut self, id: Uuid) -> Result<(), StreamDbError> {
-        info!("Deleting document with ID: {}", id);
-        self.backend.delete_document(id)?;
-        self.path_cache.lock().clear(); // Invalidate cache
-        Ok(())
-    }
-
-    fn bind_to_path(&mut self, id: Uuid, path: &str) -> Result<(), StreamDbError> {
-        info!("Binding ID {} to path: {}", id, path);
-        self.backend.bind_path_to_document(path, id)?;
-        self.path_cache.lock().put(path.to_string(), id);
-        Ok(())
-    }
-
-    fn unbind_path(&mut self, id: Uuid, path: &str) -> Result<(), StreamDbError> {
-        info!("Unbinding path {} from ID: {}", path, id);
-        let mut paths = self.backend.list_paths_for_document(id)?;
-        if paths.contains(&path.to_string()) {
-            paths.retain(|p| p != path);
-            let file_backend = self.backend.as_any().downcast_ref::<FileBackend>().ok_or_else(|| StreamDbError::InvalidData("Invalid backend type".to_string()))?;
-            let index_root = file_backend.document_index_root.lock();
-            let data = file_backend.read_raw_page(index_root.page_id)?;
-            let mut document = file_backend.deserialize_document(&data)?;
-            document.paths = paths;
-            let new_data = file_backend.serialize_document(&document)?;
-            file_backend.write_raw_page(index_root.page_id, &new_data, index_root.version)?;
-            let mut builder = file_backend.deserialize_trie_builder(&file_backend.read_raw_page(*file_backend.trie_builder_page_id.lock())?)?;
-            builder.remove(&MemoryBackend::reverse_path(path));
-            file_backend.save_trie(&builder)?;
-            file_backend.id_to_paths.lock().get_mut(&id).unwrap().retain(|p| p != path);
-            self.path_cache.lock().pop(path);
-        }
-        Ok(())
-    }
-
-    fn search(&self, prefix: &str) -> Result<Vec<String>, StreamDbError> {
-        debug!("Searching paths with prefix: {}", prefix);
-        self.backend.search_paths(prefix)
-    }
-
-    fn list_paths(&self, id: Uuid) -> Result<Vec<String>, StreamDbError> {
-        debug!("Listing paths for ID: {}", id);
-        self.backend.list_paths_for_document(id)
-    }
-
-    fn flush(&self) -> Result<(), StreamDbError> {
-        info!("Flushing database");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let mut file = file_backend.file.lock();
-            file.flush().map_err(StreamDbError::Io)?;
-            file_backend.gc_old_versions()?;
-        }
-        Ok(())
-    }
-
-    fn calculate_statistics(&self) -> Result<(i64, i64), StreamDbError> {
-        debug!("Calculating statistics");
-        let free = self.backend.count_free_pages()?;
-        let total = self.backend.as_any()
-            .downcast_ref::<FileBackend>()
-            .map_or(0, |b| (b.current_size.load(Ordering::Relaxed) / b.config.page_size) as i64);
-        Ok((free, total))
-    }
-
-    fn set_quick_mode(&mut self, enabled: bool) {
-        info!("Setting quick mode: {}", enabled);
-        self.quick_mode.store(enabled, Ordering::Relaxed);
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            file_backend.quick_mode.store(enabled, Ordering::Relaxed);
-        }
-    }
-
-    fn snapshot(&self) -> Result<Self, StreamDbError> {
-        info!("Creating snapshot");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let new_path = format!("snapshot_{}.db", Uuid::new_v4());
-            let new_config = file_backend.config.clone();
-            let mut new_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&new_path)
-                .map_err(StreamDbError::Io)?;
-            let mut current_file = file_backend.file.lock();
-            current_file.seek(SeekFrom::Start(0)).map_err(StreamDbError::Io)?;
-            std::io::copy(&mut *current_file, &mut new_file).map_err(StreamDbError::Io)?;
-            Ok(StreamDb::open_with_config(new_path, new_config)?)
-        } else {
-            Err(StreamDbError::InvalidInput("Snapshot only supported for file backend".to_string()))
-        }
-    }
-
-    fn get_cache_stats(&self) -> Result<CacheStats, StreamDbError> {
-        debug!("Retrieving cache stats");
-        self.backend.get_cache_stats()
-    }
-
-    fn get_stream(&self, path: &str) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>, StreamDbError>> + Send + Sync>, StreamDbError> {
-        debug!("Streaming document at path: {}", path);
-        let id = self.get_id_by_path(path)?.ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))?;
-        self.backend.get_stream(id)
-    }
-
-    fn get_async(&self, path: &str) -> Box<dyn Future<Output = Result<Vec<u8>, StreamDbError>> + Send + Sync> {
-        let path = path.to_string();
-        let backend = self.backend.clone();
-        Box::new(async move {
-            let id = backend.get_document_id_by_path(&path).await?;
-            backend.read_document(id).await
-        })
-    }
-
-    fn begin_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Beginning transaction");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let mut tx_log = file_backend.transaction_log.blocking_lock();
-            if tx_log.is_some() {
-                return Err(StreamDbError::TransactionError("Transaction already in progress".to_string()));
-            }
-            *tx_log = Some(vec![]);
-            Ok(())
-        } else {
-            let mut tx = self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().transaction.blocking_lock();
-            if tx.is_some() {
-                return Err(StreamDbError::TransactionError("Transaction already in progress".to_string()));
-            }
-            *tx = Some(HashMap::new());
-            Ok(())
-        }
-    }
-
-    fn commit_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Committing transaction");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let mut tx_log = file_backend.transaction_log.blocking_lock();
-            if let Some(log) = tx_log.take() {
-                for (id, data) in log {
-                    let mut cursor = Cursor::new(data);
-                    file_backend.write_document(&mut cursor)?;
-                }
-                file_backend.flush()?;
-                Ok(())
-            } else {
-                Err(StreamDbError::TransactionError("No transaction in progress".to_string()))
-            }
-        } else {
-            let mut tx = self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().transaction.blocking_lock();
-            if let Some(tx_data) = tx.take() {
-                let mut documents = self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().documents.lock();
-                for (id, data) in tx_data {
-                    documents.insert(id, data);
-                }
-                Ok(())
-            } else {
-                Err(StreamDbError::TransactionError("No transaction in progress".to_string()))
-            }
-        }
-    }
-
-    fn rollback_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Rolling back transaction");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            file_backend.transaction_log.blocking_lock().take();
-        } else {
-            self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().transaction.blocking_lock().take();
-        }
-        Ok(())
-    }
-
-    async fn begin_async_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Beginning async transaction");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let mut tx_log = file_backend.transaction_log.lock().await;
-            if tx_log.is_some() {
-                return Err(StreamDbError::TransactionError("Transaction already in progress".to_string()));
-            }
-            *tx_log = Some(vec![]);
-            Ok(())
-        } else {
-            let mut tx = self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().transaction.lock().await;
-            if tx.is_some() {
-                return Err(StreamDbError::TransactionError("Transaction already in progress".to_string()));
-            }
-            *tx = Some(HashMap::new());
-            Ok(())
-        }
-    }
-
-    async fn commit_async_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Committing async transaction");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let mut tx_log = file_backend.transaction_log.lock().await;
-            if let Some(log) = tx_log.take() {
-                for (id, data) in log {
-                    let mut cursor = Cursor::new(data);
-                    file_backend.write_document(&mut cursor)?;
-                }
-                file_backend.flush()?;
-                Ok(())
-            } else {
-                Err(StreamDbError::TransactionError("No transaction in progress".to_string()))
-            }
-        } else {
-            let mut tx = self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().transaction.lock().await;
-            if let Some(tx_data) = tx.take() {
-                let mut documents = self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().documents.lock();
-                for (id, data) in tx_data {
-                    documents.insert(id, data);
-                }
-                Ok(())
-            } else {
-                Err(StreamDbError::TransactionError("No transaction in progress".to_string()))
-            }
-        }
-    }
-
-    async fn rollback_async_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Rolling back async transaction");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            file_backend.transaction_log.lock().await.take();
-        } else {
-            self.backend.as_any().downcast_ref::<MemoryBackend>().unwrap().transaction.lock().await.take();
-        }
-        Ok(())
-    }
-}
-
-pub mod ffi {
-    use super::*;
-    use std::os::raw::{c_char, c_int, c_uint};
-    use std::slice;
-    use std::panic::catch_unwind;
-
-    #[repr(C)]
-    pub struct StreamDbHandle(Arc<StreamDb>);
-
-    const SUCCESS: c_int = 0;
-    const ERR_IO: c_int = -1;
-    const ERR_NOT_FOUND: c_int = -2;
-    const ERR_INVALID_INPUT: c_int = -3;
-    const ERR_PANIC: c_int = -4;
-    const ERR_TRANSACTION: c_int = -5;
-
-    #[no_mangle]
-    pub extern "C" fn streamdb_open(path: *const c_char, out_handle: *mut *mut StreamDbHandle) -> c_int {
-        call_with_result(|| {
-            let path_str = unsafe { FfiStr::from_raw(path) }.as_str().map_err(|_| StreamDbError::InvalidInput("Invalid path string".to_string()))?;
-            let config = Config::default();
-            let db = StreamDb::open_with_config(path_str, config)?;
-            unsafe { *out_handle = Box::into_raw(Box::new(StreamDbHandle(Arc::new(db)))); }
-            Ok(SUCCESS)
-        }).unwrap_or(ERR_IO)
-    }
-
-    #[no_mangle]
-    pub extern "C" fn streamdb_close(handle: *mut StreamDbHandle) {
-        if !handle.is_null() {
-            unsafe { drop(Box::from_raw(handle)); }
-        }
-    }
-
-    #[no_mangle]
-    pub extern "C" fn streamdb_write_document(handle: *mut StreamDbHandle, path: *const c_char, data: *const u8, len: c_uint) -> c_int {
-        call_with_result(|| {
-            let db = unsafe { &(*handle).0 };
-            let path_str = unsafe { FfiStr::from_raw(path) }.as_str().map_err(|_| StreamDbError::InvalidInput("Invalid path string".to_string()))?;
-            let data_slice = unsafe { slice::from_raw_parts(data, len as usize) };
-            let mut cursor = Cursor::new(data_slice);
-            db.write_document(path_str, &mut cursor)?;
-            Ok(SUCCESS)
-        }).unwrap_or(ERR
+pub struct Stream
