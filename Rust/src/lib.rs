@@ -8,7 +8,7 @@
 //! QuickAndDirtyMode for skipping CRC on reads, and free page management with first-fit LIFO strategy and
 //! automatic consolidation. Versioning supports basic retention (keep 2 versions, free on 3rd), with garbage
 //! collection during flush. Uses i64 for page IDs (exceeding spec's i32) for scalability.
-//!
+//!# Copyright (c) 2025 DeMoD LLC
 //! ## Adaptability for Multiple Use Cases and Platforms
 //! - **Use Cases**:
 //!   - **Embedded Systems**: Configurable page and cache sizes for low memory; optional no-mmap mode.
