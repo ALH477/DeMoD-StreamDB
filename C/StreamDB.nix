@@ -2,7 +2,7 @@
   description = "StreamDB - A lightweight, thread-safe embedded database";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/24.11";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -29,14 +29,15 @@
           installPhase = ''
             mkdir -p $out/lib $out/include
             cp libstreamdb.a $out/lib/
-            cp libstreamdb.h $out/include/libstreamdb.h
+            cp streamdb.h $out/include/
+            cp libstreamdb_wrapper.h $out/include/
           '';
 
           meta = with pkgs.lib; {
             description = "StreamDB - A lightweight, thread-safe embedded database using reverse trie";
             license = licenses.lgpl21Plus;
             platforms = platforms.unix;
-            maintainers = [ "DeMoD LLC" ];
+            maintainers = [ { name = "DeMoD LLC"; } ];
           };
         };
       });
