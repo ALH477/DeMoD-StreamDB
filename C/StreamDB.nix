@@ -2,7 +2,7 @@
   description = "StreamDB - A lightweight, thread-safe embedded database";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/24.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -12,33 +12,41 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
-        packages.default = pkgs.stdenv.mkDerivation rec {
-          pname = "streamdb";
-          version = "0.1.0"; # Initial version; update as needed
+        packages = rec {
+          default = pkgs.stdenv.mkDerivation rec {
+            pname = "streamdb";
+            version = "0.1.0"; # Initial version; update as needed
 
-          src = ./.; # Point to local directory containing source files
+            src = ./.; # Point to local directory containing source files
 
-          buildInputs = [ pkgs.util-linux.lib ]; # For libuuid
+            buildInputs = [ pkgs.util-linux.dev ]; # For libuuid headers (uuid/uuid.h)
 
-          buildPhase = ''
-            $CC -c streamdb.c -o streamdb.o
-            $CC -c libstreamdb_wrapper.c -o wrapper.o
-            ar rcs libstreamdb.a streamdb.o wrapper.o
-          '';
+            postPatch = ''
+              sed -i '4i #include <stdlib.h>' libstreamdb_wrapper.c
+            '';
 
-          installPhase = ''
-            mkdir -p $out/lib $out/include
-            cp libstreamdb.a $out/lib/
-            cp streamdb.h $out/include/
-            cp libstreamdb_wrapper.h $out/include/
-          '';
+            buildPhase = ''
+              $CC -c streamdb.c -o streamdb.o
+              $CC -c libstreamdb_wrapper.c -o wrapper.o
+              ar rcs libstreamdb.a streamdb.o wrapper.o
+            '';
 
-          meta = with pkgs.lib; {
-            description = "StreamDB - A lightweight, thread-safe embedded database using reverse trie";
-            license = licenses.lgpl21Plus;
-            platforms = platforms.unix;
-            maintainers = [ { name = "DeMoD LLC"; } ];
+            installPhase = ''
+              mkdir -p $out/lib $out/include
+              cp libstreamdb.a $out/lib/
+              cp libstreamdb_wrapper.h $out/include/libstreamdb.h
+              cp streamdb.h $out/include/streamdb.h
+            '';
+
+            meta = with pkgs.lib; {
+              description = "StreamDB - A lightweight, thread-safe embedded database using reverse trie";
+              license = licenses.lgpl21Plus;
+              platforms = platforms.linux ++ platforms.darwin ++ platforms.windows ++ platforms.unix; # Broad platform support
+              maintainers = [ "DeMoD LLC" ];
+            };
           };
+
+          streamdb = default; # Explicitly expose 'streamdb' package
         };
       });
 }
