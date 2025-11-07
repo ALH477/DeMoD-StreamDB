@@ -5,6 +5,8 @@
 
 ![LGPLv3](https://www.gnu.org/graphics/lgplv3-with-text-154x68.png)
 
+![](StreamDB-logo.svg)
+
 StreamDb is a lightweight, embedded key-value database written in Rust, designed for storing and retrieving binary streams (up to 256MB) associated with string paths. It supports efficient prefix-based searches via a compressed reverse Trie index, optimized for low-latency use cases like game engines, IoT devices, and the DeMoD Communications Framework (DCF). StreamDb emphasizes reliability, performance, and adaptability across embedded systems, servers, and WebAssembly (WASM) environments.
 
 This is a clean-room reimplementation in Rust, based on the public concepts from Iain Ballard’s incomplete C# repository (BSD-licensed), with a fresh LGPLv3 license for the FOSS community. **No reverse engineering of proprietary StreamDB files or systems was performed**; the implementation derives from a design specification built on the C# repository’s ideas.
