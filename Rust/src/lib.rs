@@ -167,7 +167,6 @@ pub struct StreamDb {
     backend: Arc<dyn Backend>,
     trie: Arc<RwLock<Trie>>,
     cache: Mutex<LruCache<Vec<u8>, Uuid>>,
-    cache_stats: CacheStats,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     dirty: AtomicBool,
@@ -202,7 +201,6 @@ impl StreamDb {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(config.cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap())
             )),
-            cache_stats: CacheStats::default(),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
@@ -233,7 +231,6 @@ impl StreamDb {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(config.cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap())
             )),
-            cache_stats: CacheStats::default(),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
@@ -483,12 +480,14 @@ impl StreamDb {
         Ok(Stats {
             key_count: trie.len(),
             total_size: backend_stats.total_size,
-            cache_stats: CacheStats {
-                hits: self.cache_hits.load(Ordering::Relaxed),
-                misses: self.cache_misses.load(Ordering::Relaxed),
-            },
+            cache_stats: self.cache_stats(),
             is_dirty: self.dirty.load(Ordering::Relaxed),
         })
+    }
+    
+    /// Get the current configuration
+    pub fn config(&self) -> &Config {
+        &self.config
     }
     
     /// Get cache statistics
