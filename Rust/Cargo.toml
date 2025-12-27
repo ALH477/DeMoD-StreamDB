@@ -40,7 +40,7 @@ parking_lot = "0.12"
 log = "0.4"
 
 # Persistent data structures
-im = "15.1"
+im = { version = "15.1", features = ["serde"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
