@@ -174,6 +174,14 @@ pub struct FileBackend {
 }
 
 #[cfg(feature = "persistence")]
+impl FileBackend {
+    /// Get the configuration
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+}
+
+#[cfg(feature = "persistence")]
 #[derive(Clone, Debug)]
 struct DocumentMeta {
     offset: u64,
