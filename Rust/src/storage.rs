@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "persistence")]
 use std::fs::{File, OpenOptions};
 #[cfg(feature = "persistence")]
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(feature = "persistence")]
 use std::path::Path;
 #[cfg(feature = "persistence")]
