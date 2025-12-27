@@ -1,319 +1,689 @@
-//! StreamDb - A reverse Trie index key-value database in Rust.
+//! # StreamDB
 //!
-//! ## Overview
-//! StreamDb is a thread-safe, embedded key-value store designed for path-based queries with efficient prefix searches. Keys are string paths, and values are binary streams (up to 256MB). It uses a paged storage system with chaining, LRU caching, quick mode for faster reads, and free page management. Versioning retains two versions with garbage collection. It supports WebAssembly (WASM) and C interoperability via FFI.
+//! A lightweight, thread-safe embedded key-value database using a reverse trie
+//! for efficient suffix-based searches.
 //!
 //! ## Features
-//! - Reverse Trie indexing for O(log n) path updates and O(k log n) prefix searches (k=path length).
-//! - Persistent storage with write-ahead logging (WAL) for crash-consistent transactions.
-//! - Thread-safe with async transaction support via Tokio.
-//! - Optional AES-256-GCM encryption for data at rest.
-//! - Comprehensive FFI for C integration.
-//! - Configurable page sizes, caching, and compression.
 //!
-//! ## Production Improvements
-//! - Persistent Trie using `im` crate for efficient updates.
-//! - WAL with `okaywal` for durability.
-//! - Full FFI coverage with safe memory handling.
-//! - WASM support via `no_std` and conditional compilation.
-//! - Performance profiling with `valgrind` and `flamegraph`.
-//! - Security audits via `cargo audit` in CI.
+//! - **Thread-safe**: All operations use interior mutability with proper locking
+//! - **Suffix search**: O(m + k) lookup for keys ending with a given suffix
+//! - **Binary keys**: Supports arbitrary byte sequences
+//! - **Persistence**: Optional file-based storage with crash recovery
+//! - **Async support**: Optional async API via Tokio
+//! - **FFI bindings**: C-compatible interface for cross-language use
 //!
-//! ## Example
+//! ## Quick Start
+//!
+//! ```rust
+//! use streamdb::{StreamDb, Config, Result};
+//!
+//! fn main() -> Result<()> {
+//!     // Create an in-memory database
+//!     let db = StreamDb::open_memory()?;
+//!     
+//!     // Insert data
+//!     let id = db.insert(b"user:alice", b"Alice Smith")?;
+//!     
+//!     // Retrieve data
+//!     let value = db.get(b"user:alice")?;
+//!     assert_eq!(value, Some(b"Alice Smith".to_vec()));
+//!     
+//!     // Suffix search - find all keys ending with "alice"
+//!     let results = db.suffix_search(b"alice")?;
+//!     assert!(results.iter().any(|(k, _)| k == b"user:alice"));
+//!     
+//!     Ok(())
+//! }
 //! ```
-//! use streamdb::{Config, Database, StreamDb};
-//! use std::io::Cursor;
 //!
-//! let mut db = StreamDb::open_with_config("test.db", Config::default()).unwrap();
-//! let mut data = Cursor::new(b"Hello, StreamDb!".to_vec());
-//! let id = db.write_document("/path/to/doc", &mut data).unwrap();
-//! let retrieved = db.get("/path/to/doc").unwrap();
-//! assert_eq!(retrieved, b"Hello, StreamDb!");
-//! let paths = db.search("/path").unwrap();
-//! assert!(paths.contains(&"/path/to/doc".to_string()));
-//! db.delete("/path/to/doc").unwrap();
+//! ## Persistence
+//!
+//! ```rust,no_run
+//! use streamdb::{StreamDb, Config, Result};
+//!
+//! fn main() -> Result<()> {
+//!     // Open with file persistence
+//!     let config = Config::default();
+//!     let db = StreamDb::open("mydb.dat", config)?;
+//!     
+//!     db.insert(b"key", b"value")?;
+//!     db.flush()?;  // Ensure data is persisted
+//!     
+//!     Ok(())
+//! }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![warn(missing_docs)]
+#![warn(rust_2018_idioms)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod error;
 pub mod trie;
-pub mod backend;
+pub mod storage;
+#[cfg(feature = "ffi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ffi")))]
 pub mod ffi;
-#[cfg(test)]
-pub mod tests;
 
-pub use backend::{DatabaseBackend, MemoryBackend, FileBackend};
-pub use ffi::StreamDbHandle;
-pub use trie::TrieNode;
+pub use error::{Error, Result};
+pub use trie::Trie;
+pub use storage::{Backend, MemoryBackend, Stats};
 
-use std::io::Read;
-use std::path::Path;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use parking_lot::Mutex;
+#[cfg(feature = "persistence")]
+pub use storage::FileBackend;
+
+use parking_lot::{Mutex, RwLock};
 use lru::LruCache;
 use uuid::Uuid;
-use futures::Future;
-use log::{debug, info};
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use log::{debug, info, warn};
 
-#[derive(Debug)]
-pub enum StreamDbError {
-    Io(std::io::Error),
-    NotFound(String),
-    InvalidInput(String),
-    InvalidData(String),
-    TransactionError(String),
-    EncryptionError(String),
-}
+/// Library version
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, Debug)]
+/// Maximum key length in bytes
+pub const MAX_KEY_LEN: usize = 1024;
+
+/// Maximum value size (256 MB)
+pub const MAX_VALUE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Configuration for StreamDb
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub page_size: u64,
-    pub page_header_size: u64,
-    pub max_document_size: u64,
-    pub max_db_size: u64,
-    pub max_pages: i64,
-    pub page_cache_size: usize,
+    /// Size of pages for file storage (default: 4096)
+    pub page_size: usize,
+    
+    /// Maximum number of entries in the path cache (default: 10000)
+    pub cache_size: usize,
+    
+    /// Auto-flush interval in milliseconds (0 to disable, default: 5000)
+    pub flush_interval_ms: u64,
+    
+    /// Enable memory-mapped I/O when available (default: true)
     pub use_mmap: bool,
+    
+    /// Enable compression for values (default: false)
+    #[cfg(feature = "compression")]
     pub use_compression: bool,
-    pub versions_to_keep: i32,
+    
+    /// Encryption key for data at rest (32 bytes for AES-256)
     #[cfg(feature = "encryption")]
-    pub encryption_key: Option<Vec<u8>>,
+    pub encryption_key: Option<[u8; 32]>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             page_size: 4096,
-            page_header_size: 32,
-            max_document_size: 256 * 1024 * 1024,
-            max_db_size: u64::MAX,
-            max_pages: i64::MAX,
-            page_cache_size: 1000,
+            cache_size: 10000,
+            flush_interval_ms: 5000,
             use_mmap: true,
-            use_compression: true,
-            versions_to_keep: 2,
+            #[cfg(feature = "compression")]
+            use_compression: false,
             #[cfg(feature = "encryption")]
             encryption_key: None,
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// Result entry from a search operation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResult {
+    /// The full key
+    pub key: Vec<u8>,
+    /// The document ID
+    pub id: Uuid,
+}
+
+/// Cache statistics
+#[derive(Debug, Clone, Default)]
 pub struct CacheStats {
-    pub hits: usize,
-    pub misses: usize,
+    /// Number of cache hits
+    pub hits: u64,
+    /// Number of cache misses
+    pub misses: u64,
 }
 
-pub trait Database {
-    fn write_document(&mut self, path: &str, data: &mut dyn Read) -> Result<Uuid, StreamDbError>;
-    fn get(&self, path: &str) -> Result<Vec<u8>, StreamDbError>;
-    fn get_quick(&self, path: &str, quick: bool) -> Result<Vec<u8>, StreamDbError>;
-    fn get_id_by_path(&self, path: &str) -> Result<Option<Uuid>, StreamDbError>;
-    fn delete(&mut self, path: &str) -> Result<(), StreamDbError>;
-    fn delete_by_id(&mut self, id: Uuid) -> Result<(), StreamDbError>;
-    fn bind_to_path(&mut self, id: Uuid, path: &str) -> Result<(), StreamDbError>;
-    fn unbind_path(&mut self, id: Uuid, path: &str) -> Result<(), StreamDbError>;
-    fn search(&self, prefix: &str) -> Result<Vec<String>, StreamDbError>;
-    fn list_paths(&self, id: Uuid) -> Result<Vec<String>, StreamDbError>;
-    fn flush(&self) -> Result<(), StreamDbError>;
-    fn calculate_statistics(&self) -> Result<(i64, i64), StreamDbError>;
-    fn set_quick_mode(&mut self, enabled: bool);
-    fn snapshot(&self) -> Result<Self, StreamDbError> where Self: Sized;
-    fn get_cache_stats(&self) -> Result<CacheStats, StreamDbError>;
-    fn get_stream(&self, path: &str) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>, StreamDbError>> + Send + Sync>, StreamDbError>;
-    fn get_async(&self, path: &str) -> Box<dyn Future<Output = Result<Vec<u8>, StreamDbError>> + Send + Sync>;
-    fn begin_transaction(&mut self) -> Result<(), StreamDbError>;
-    fn commit_transaction(&mut self) -> Result<(), StreamDbError>;
-    fn rollback_transaction(&mut self) -> Result<(), StreamDbError>;
-    fn begin_async_transaction(&mut self) -> Box<dyn Future<Output = Result<(), StreamDbError>> + Send + Sync>;
-    fn commit_async_transaction(&mut self) -> Box<dyn Future<Output = Result<(), StreamDbError>> + Send + Sync>;
-    fn rollback_async_transaction(&mut self) -> Box<dyn Future<Output = Result<(), StreamDbError>> + Send + Sync>;
+impl CacheStats {
+    /// Calculate hit ratio (0.0 to 1.0)
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
 }
 
+/// The main StreamDB database handle
+///
+/// This is the primary interface for interacting with StreamDB.
+/// All methods are thread-safe and can be called from multiple threads.
 pub struct StreamDb {
-    backend: Arc<dyn DatabaseBackend + Send + Sync>,
-    path_cache: Mutex<LruCache<String, Uuid>>,
-    quick_mode: AtomicBool,
+    backend: Arc<dyn Backend>,
+    trie: Arc<RwLock<Trie>>,
+    cache: Mutex<LruCache<Vec<u8>, Uuid>>,
+    cache_stats: CacheStats,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    dirty: AtomicBool,
+    config: Config,
 }
 
 impl StreamDb {
-    pub fn open_with_config<P: AsRef<Path>>(path: P, config: Config) -> Result<Self, StreamDbError> {
+    /// Open a database with file persistence
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the database file
+    /// * `config` - Configuration options
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use streamdb::{StreamDb, Config};
+    ///
+    /// let db = StreamDb::open("mydb.dat", Config::default()).unwrap();
+    /// ```
+    #[cfg(feature = "persistence")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
+    pub fn open<P: AsRef<Path>>(path: P, config: Config) -> Result<Self> {
         info!("Opening StreamDb at {:?}", path.as_ref());
-        let backend = Arc::new(FileBackend::new(path.as_ref(), config)?);
+        
+        let (backend, trie) = FileBackend::open(path.as_ref(), &config)?;
+        
         Ok(Self {
-            backend,
-            path_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(config.page_cache_size).unwrap())),
-            quick_mode: AtomicBool::new(false),
+            backend: Arc::new(backend),
+            trie: Arc::new(RwLock::new(trie)),
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(config.cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap())
+            )),
+            cache_stats: CacheStats::default(),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            config,
         })
+    }
+    
+    /// Create an in-memory database (no persistence)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use streamdb::StreamDb;
+    ///
+    /// let db = StreamDb::open_memory().unwrap();
+    /// ```
+    pub fn open_memory() -> Result<Self> {
+        Self::open_memory_with_config(Config::default())
+    }
+    
+    /// Create an in-memory database with custom configuration
+    pub fn open_memory_with_config(config: Config) -> Result<Self> {
+        info!("Opening in-memory StreamDb");
+        
+        Ok(Self {
+            backend: Arc::new(MemoryBackend::new()),
+            trie: Arc::new(RwLock::new(Trie::new())),
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(config.cache_size).unwrap_or(NonZeroUsize::new(1000).unwrap())
+            )),
+            cache_stats: CacheStats::default(),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            config,
+        })
+    }
+    
+    /// Insert or update a key-value pair
+    ///
+    /// Returns the document ID for the inserted value.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key (max 1024 bytes)
+    /// * `value` - The value (max 256 MB)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use streamdb::StreamDb;
+    ///
+    /// let db = StreamDb::open_memory().unwrap();
+    /// let id = db.insert(b"mykey", b"myvalue").unwrap();
+    /// ```
+    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<Uuid> {
+        self.validate_key(key)?;
+        self.validate_value(value)?;
+        
+        debug!("Inserting key: {:?} ({} bytes value)", key, value.len());
+        
+        // Write value to backend
+        let id = self.backend.write(value)?;
+        
+        // Update trie
+        {
+            let mut trie = self.trie.write();
+            *trie = trie.insert(key, id);
+        }
+        
+        // Update cache
+        {
+            let mut cache = self.cache.lock();
+            cache.put(key.to_vec(), id);
+        }
+        
+        self.dirty.store(true, Ordering::Release);
+        
+        Ok(id)
+    }
+    
+    /// Get a value by key
+    ///
+    /// Returns `None` if the key doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use streamdb::StreamDb;
+    ///
+    /// let db = StreamDb::open_memory().unwrap();
+    /// db.insert(b"key", b"value").unwrap();
+    /// 
+    /// let value = db.get(b"key").unwrap();
+    /// assert_eq!(value, Some(b"value".to_vec()));
+    /// ```
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.validate_key(key)?;
+        
+        debug!("Getting key: {:?}", key);
+        
+        // Check cache first
+        let id = {
+            let mut cache = self.cache.lock();
+            if let Some(&id) = cache.get(&key.to_vec()) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                Some(id)
+            } else {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        };
+        
+        // If not in cache, check trie
+        let id = match id {
+            Some(id) => Some(id),
+            None => {
+                let trie = self.trie.read();
+                let found_id = trie.get(key);
+                
+                // Update cache if found
+                if let Some(id) = found_id {
+                    let mut cache = self.cache.lock();
+                    cache.put(key.to_vec(), id);
+                }
+                
+                found_id
+            }
+        };
+        
+        // Read from backend
+        match id {
+            Some(id) => {
+                let value = self.backend.read(id)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// Check if a key exists
+    ///
+    /// More efficient than `get()` as it doesn't read the value.
+    pub fn exists(&self, key: &[u8]) -> Result<bool> {
+        self.validate_key(key)?;
+        
+        // Check cache first
+        {
+            let mut cache = self.cache.lock();
+            if cache.get(&key.to_vec()).is_some() {
+                return Ok(true);
+            }
+        }
+        
+        // Check trie
+        let trie = self.trie.read();
+        Ok(trie.get(key).is_some())
+    }
+    
+    /// Delete a key-value pair
+    ///
+    /// Returns `true` if the key existed and was deleted.
+    pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.validate_key(key)?;
+        
+        debug!("Deleting key: {:?}", key);
+        
+        // Get ID from trie
+        let id = {
+            let trie = self.trie.read();
+            trie.get(key)
+        };
+        
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        
+        // Remove from trie
+        {
+            let mut trie = self.trie.write();
+            if let Some(new_trie) = trie.remove(key) {
+                *trie = new_trie;
+            }
+        }
+        
+        // Remove from cache
+        {
+            let mut cache = self.cache.lock();
+            cache.pop(&key.to_vec());
+        }
+        
+        // Delete from backend
+        self.backend.delete(id)?;
+        
+        self.dirty.store(true, Ordering::Release);
+        
+        Ok(true)
+    }
+    
+    /// Search for all keys ending with the given suffix
+    ///
+    /// Returns a list of matching keys and their document IDs.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use streamdb::StreamDb;
+    ///
+    /// let db = StreamDb::open_memory().unwrap();
+    /// db.insert(b"user:alice", b"Alice").unwrap();
+    /// db.insert(b"user:bob", b"Bob").unwrap();
+    /// db.insert(b"admin:alice", b"Alice Admin").unwrap();
+    ///
+    /// // Find all keys ending with "alice"
+    /// let results = db.suffix_search(b"alice").unwrap();
+    /// assert_eq!(results.len(), 2);
+    /// ```
+    pub fn suffix_search(&self, suffix: &[u8]) -> Result<Vec<SearchResult>> {
+        if suffix.is_empty() {
+            return Err(Error::InvalidInput("Suffix cannot be empty".into()));
+        }
+        if suffix.len() > MAX_KEY_LEN {
+            return Err(Error::InvalidInput(format!(
+                "Suffix too long: {} bytes (max {})",
+                suffix.len(),
+                MAX_KEY_LEN
+            )));
+        }
+        
+        debug!("Suffix search: {:?}", suffix);
+        
+        let trie = self.trie.read();
+        let results = trie.suffix_search(suffix);
+        
+        Ok(results.into_iter()
+            .map(|(key, id)| SearchResult { key, id })
+            .collect())
+    }
+    
+    /// Iterate over all key-value pairs
+    ///
+    /// The callback receives each key and document ID. Return `true` to continue,
+    /// `false` to stop iteration early.
+    pub fn for_each<F>(&self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&[u8], Uuid) -> bool,
+    {
+        let trie = self.trie.read();
+        trie.for_each(&mut callback);
+        Ok(())
+    }
+    
+    /// Flush all pending writes to disk
+    ///
+    /// This is automatically called on drop, but can be called manually
+    /// to ensure durability at specific points.
+    pub fn flush(&self) -> Result<()> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        
+        info!("Flushing database");
+        
+        // Serialize and write trie
+        let trie = self.trie.read();
+        self.backend.flush(&trie)?;
+        
+        self.dirty.store(false, Ordering::Release);
+        
+        Ok(())
+    }
+    
+    /// Get database statistics
+    pub fn stats(&self) -> Result<Stats> {
+        let trie = self.trie.read();
+        let backend_stats = self.backend.stats()?;
+        
+        Ok(Stats {
+            key_count: trie.len(),
+            total_size: backend_stats.total_size,
+            cache_stats: CacheStats {
+                hits: self.cache_hits.load(Ordering::Relaxed),
+                misses: self.cache_misses.load(Ordering::Relaxed),
+            },
+            is_dirty: self.dirty.load(Ordering::Relaxed),
+        })
+    }
+    
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.cache_hits.load(Ordering::Relaxed),
+            misses: self.cache_misses.load(Ordering::Relaxed),
+        }
+    }
+    
+    /// Clear the path cache
+    pub fn clear_cache(&self) {
+        let mut cache = self.cache.lock();
+        cache.clear();
+    }
+    
+    /// Get the number of keys in the database
+    pub fn len(&self) -> usize {
+        let trie = self.trie.read();
+        trie.len()
+    }
+    
+    /// Check if the database is empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    // Validation helpers
+    
+    fn validate_key(&self, key: &[u8]) -> Result<()> {
+        if key.is_empty() {
+            return Err(Error::InvalidInput("Key cannot be empty".into()));
+        }
+        if key.len() > MAX_KEY_LEN {
+            return Err(Error::InvalidInput(format!(
+                "Key too long: {} bytes (max {})",
+                key.len(),
+                MAX_KEY_LEN
+            )));
+        }
+        Ok(())
+    }
+    
+    fn validate_value(&self, value: &[u8]) -> Result<()> {
+        if value.len() > MAX_VALUE_SIZE {
+            return Err(Error::InvalidInput(format!(
+                "Value too large: {} bytes (max {})",
+                value.len(),
+                MAX_VALUE_SIZE
+            )));
+        }
+        Ok(())
     }
 }
 
-impl Database for StreamDb {
-    fn write_document(&mut self, path: &str, data: &mut dyn Read) -> Result<Uuid, StreamDbError> {
-        info!("Writing document to path: {}", path);
-        let id = self.backend.write_document(data)?;
-        self.bind_to_path(id, path)?;
-        Ok(id)
-    }
-
-    fn get(&self, path: &str) -> Result<Vec<u8>, StreamDbError> {
-        debug!("Getting document at path: {}", path);
-        let id = self.get_id_by_path(path)?.ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))?;
-        self.backend.read_document(id)
-    }
-
-    fn get_quick(&self, path: &str, quick: bool) -> Result<Vec<u8>, StreamDbError> {
-        debug!("Getting document (quick={}) at path: {}", quick, path);
-        let id = self.get_id_by_path(path)?.ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))?;
-        self.backend.read_document_quick(id, quick)
-    }
-
-    fn get_id_by_path(&self, path: &str) -> Result<Option<Uuid>, StreamDbError> {
-        let mut cache = self.path_cache.lock();
-        if let Some(id) = cache.get(path) {
-            debug!("Cache hit for path: {}", path);
-            return Ok(Some(*id));
-        }
-        let id = self.backend.get_document_id_by_path(path)?;
-        cache.put(path.to_string(), id);
-        debug!("Cache miss, stored ID for path: {}", path);
-        Ok(Some(id))
-    }
-
-    fn delete(&mut self, path: &str) -> Result<(), StreamDbError> {
-        info!("Deleting document at path: {}", path);
-        if let Some(id) = self.get_id_by_path(path)? {
-            self.delete_by_id(id)?;
-            self.path_cache.lock().pop(path);
-        } else {
-            return Err(StreamDbError::NotFound(format!("Path not found: {}", path)));
-        }
-        Ok(())
-    }
-
-    fn delete_by_id(&mut self, id: Uuid) -> Result<(), StreamDbError> {
-        info!("Deleting document with ID: {}", id);
-        self.backend.delete_document(id)?;
-        self.path_cache.lock().clear();
-        Ok(())
-    }
-
-    fn bind_to_path(&mut self, id: Uuid, path: &str) -> Result<(), StreamDbError> {
-        info!("Binding ID {} to path: {}", id, path);
-        self.backend.bind_path_to_document(path, id)?;
-        self.path_cache.lock().put(path.to_string(), id);
-        Ok(())
-    }
-
-    fn unbind_path(&mut self, id: Uuid, path: &str) -> Result<(), StreamDbError> {
-        info!("Unbinding path {} from ID: {}", path, id);
-        let mut trie = self.backend.path_trie.write();
-        let reversed = FileBackend::reverse_path(path);
-        if let Some(new_trie) = trie.remove(&reversed) {
-            *trie = new_trie;
-        }
-        self.path_cache.lock().pop(path);
-        Ok(())
-    }
-
-    fn search(&self, prefix: &str) -> Result<Vec<String>, StreamDbError> {
-        debug!("Searching paths with prefix: {}", prefix);
-        self.backend.search_paths(prefix)
-    }
-
-    fn list_paths(&self, id: Uuid) -> Result<Vec<String>, StreamDbError> {
-        debug!("Listing paths for ID: {}", id);
-        self.backend.list_paths_for_document(id)
-    }
-
-    fn flush(&self) -> Result<(), StreamDbError> {
-        info!("Flushing database");
-        self.backend.flush()
-    }
-
-    fn calculate_statistics(&self) -> Result<(i64, i64), StreamDbError> {
-        debug!("Calculating statistics");
-        self.backend.calculate_statistics()
-    }
-
-    fn set_quick_mode(&mut self, enabled: bool) {
-        info!("Setting quick mode: {}", enabled);
-        self.quick_mode.store(enabled, Ordering::Relaxed);
-        self.backend.set_quick_mode(enabled);
-    }
-
-    fn snapshot(&self) -> Result<Self, StreamDbError> where Self: Sized {
-        info!("Creating snapshot");
-        if let Some(file_backend) = self.backend.as_any().downcast_ref::<FileBackend>() {
-            let new_path = format!("snapshot_{}.db", Uuid::new_v4());
-            let new_config = file_backend.config.clone();
-            let mut new_file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&new_path)
-                .map_err(StreamDbError::Io)?;
-            let mut current_file = file_backend.file.lock();
-            current_file.seek(SeekFrom::Start(0)).map_err(StreamDbError::Io)?;
-            std::io::copy(&mut *current_file, &mut new_file).map_err(StreamDbError::Io)?;
-            new_file.flush().map_err(StreamDbError::Io)?;
-            StreamDb::open_with_config(new_path, new_config)
-        } else {
-            Err(StreamDbError::InvalidInput("Snapshot only supported for file backend".to_string()))
+impl Drop for StreamDb {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush() {
+            warn!("Failed to flush on drop: {}", e);
         }
     }
+}
 
-    fn get_cache_stats(&self) -> Result<CacheStats, StreamDbError> {
-        debug!("Retrieving cache stats");
-        self.backend.get_cache_stats()
+// StreamDb is Send + Sync because all interior mutability is properly synchronized
+unsafe impl Send for StreamDb {}
+unsafe impl Sync for StreamDb {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_basic_operations() {
+        let db = StreamDb::open_memory().unwrap();
+        
+        // Insert
+        let id = db.insert(b"key1", b"value1").unwrap();
+        assert!(!id.is_nil());
+        
+        // Get
+        let value = db.get(b"key1").unwrap();
+        assert_eq!(value, Some(b"value1".to_vec()));
+        
+        // Exists
+        assert!(db.exists(b"key1").unwrap());
+        assert!(!db.exists(b"nonexistent").unwrap());
+        
+        // Delete
+        assert!(db.delete(b"key1").unwrap());
+        assert!(!db.delete(b"key1").unwrap()); // Already deleted
+        
+        // Verify deletion
+        assert_eq!(db.get(b"key1").unwrap(), None);
     }
-
-    fn get_stream(&self, path: &str) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>, StreamDbError>> + Send + Sync>, StreamDbError> {
-        debug!("Streaming document at path: {}", path);
-        let id = self.get_id_by_path(path)?.ok_or(StreamDbError::NotFound(format!("Path not found: {}", path)))?;
-        self.backend.get_stream(id)
+    
+    #[test]
+    fn test_suffix_search() {
+        let db = StreamDb::open_memory().unwrap();
+        
+        db.insert(b"user:alice", b"Alice").unwrap();
+        db.insert(b"user:bob", b"Bob").unwrap();
+        db.insert(b"admin:alice", b"Alice Admin").unwrap();
+        db.insert(b"guest:charlie", b"Charlie").unwrap();
+        
+        // Search for "alice"
+        let results = db.suffix_search(b"alice").unwrap();
+        assert_eq!(results.len(), 2);
+        
+        let keys: Vec<_> = results.iter().map(|r| r.key.as_slice()).collect();
+        assert!(keys.contains(&b"user:alice".as_slice()));
+        assert!(keys.contains(&b"admin:alice".as_slice()));
+        
+        // Search for "bob"
+        let results = db.suffix_search(b"bob").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, b"user:bob");
     }
-
-    fn get_async(&self, path: &str) -> Box<dyn Future<Output = Result<Vec<u8>, StreamDbError>> + Send + Sync> {
-        let path = path.to_string();
-        let backend = self.backend.clone();
-        Box::new(async move {
-            let id = backend.get_document_id_by_path(&path)?;
-            backend.read_document(id)
-        })
+    
+    #[test]
+    fn test_binary_keys() {
+        let db = StreamDb::open_memory().unwrap();
+        
+        let key = vec![0x00, 0x01, 0xFF, 0xFE, 0x00];
+        let value = b"binary value";
+        
+        db.insert(&key, value).unwrap();
+        
+        let retrieved = db.get(&key).unwrap();
+        assert_eq!(retrieved, Some(value.to_vec()));
     }
-
-    fn begin_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Beginning transaction");
-        self.backend.begin_transaction()
+    
+    #[test]
+    fn test_update() {
+        let db = StreamDb::open_memory().unwrap();
+        
+        db.insert(b"key", b"value1").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value1".to_vec()));
+        
+        db.insert(b"key", b"value2").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value2".to_vec()));
     }
-
-    fn commit_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Committing transaction");
-        self.backend.commit_transaction()
+    
+    #[test]
+    fn test_stats() {
+        let db = StreamDb::open_memory().unwrap();
+        
+        db.insert(b"key1", b"value1").unwrap();
+        db.insert(b"key2", b"value2").unwrap();
+        
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.key_count, 2);
     }
-
-    fn rollback_transaction(&mut self) -> Result<(), StreamDbError> {
-        info!("Rolling back transaction");
-        self.backend.rollback_transaction()
+    
+    #[test]
+    fn test_key_validation() {
+        let db = StreamDb::open_memory().unwrap();
+        
+        // Empty key
+        assert!(db.insert(b"", b"value").is_err());
+        
+        // Key too long
+        let long_key = vec![0u8; MAX_KEY_LEN + 1];
+        assert!(db.insert(&long_key, b"value").is_err());
+        
+        // Max length key should work
+        let max_key = vec![0u8; MAX_KEY_LEN];
+        assert!(db.insert(&max_key, b"value").is_ok());
     }
-
-    fn begin_async_transaction(&mut self) -> Box<dyn Future<Output = Result<(), StreamDbError>> + Send + Sync> {
-        let backend = self.backend.clone();
-        Box::new(async move {
-            backend.begin_async_transaction().await
-        })
-    }
-
-    fn commit_async_transaction(&mut self) -> Box<dyn Future<Output = Result<(), StreamDbError>> + Send + Sync> {
-        let backend = self.backend.clone();
-        Box::new(async move {
-            backend.commit_async_transaction().await
-        })
-    }
-
-    fn rollback_async_transaction(&mut self) -> Box<dyn Future<Output = Result<(), StreamDbError>> + Send + Sync> {
-        let backend = self.backend.clone();
-        Box::new(async move {
-            backend.rollback_async_transaction().await
-        })
+    
+    #[test]
+    fn test_concurrent_access() {
+        use std::thread;
+        use std::sync::Arc;
+        
+        let db = Arc::new(StreamDb::open_memory().unwrap());
+        let mut handles = vec![];
+        
+        // Spawn writers
+        for i in 0..10 {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for j in 0..100 {
+                    let key = format!("key:{}:{}", i, j);
+                    let value = format!("value:{}:{}", i, j);
+                    db.insert(key.as_bytes(), value.as_bytes()).unwrap();
+                }
+            }));
+        }
+        
+        // Wait for all writers
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        
+        // Verify count
+        assert_eq!(db.len(), 1000);
     }
 }
