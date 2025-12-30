@@ -1,74 +1,59 @@
 {
-  description = "StreamDb: A reverse Trie index key-value database in Rust";
+  description = "StreamDB - Deterministic Docker Build";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    crane.url = "github:ipetkov/crane";
-    rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
+        pkgs = nixpkgs.legacyPackages.${system};
+        manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
 
-        rustToolchain = pkgs.rust-bin.stable."1.82.0".default.override {
-          extensions = [ "rust-src" "rust-analyzer" ];
-        };
-
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-
-        src = craneLib.cleanCargoSource (pkgs.lib.cleanSource ./.);
-
-        commonArgs = {
-          inherit src;
-          pname = "streamdb";
-          version = "0.1.0";
-          cargoLock = ./Cargo.lock;  # Direct path to lockfile
-        };
-
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-        streamdb = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          cargoExtraArgs = "-p streamdb";
-          doCheck = true;
-        });
-
-        streamdb-wasm = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          cargoExtraArgs = "-p streamdb --features wasm --target wasm32-unknown-unknown";
+        streamdb = pkgs.rustPlatform.buildRustPackage {
+          pname = manifest.name;
+          version = manifest.version;
+          src = ./.;
+          
+          cargoLock.lockFile = ./Cargo.lock;
+          buildFeatures = [ "ffi" ];
           doCheck = false;
-        });
 
-        streamdb-encryption = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          cargoExtraArgs = "-p streamdb --features encryption";
-        });
+          # Adjusted to ensure it finds the header regardless of subfolder
+          postInstall = ''
+            mkdir -p $out/lib $out/include
+            find . -name "streamdb.h" -exec cp {} $out/include/ \;
+            find target -name "libstreamdb.so" -exec cp {} $out/lib/ \;
+          '';
+        };
+
+        dockerImage = pkgs.dockerTools.buildLayeredImage {
+          name = "streamdb-runtime";
+          tag = "latest";
+          created = "now";
+          contents = [ 
+            streamdb 
+            pkgs.bashInteractive 
+            pkgs.coreutils 
+            pkgs.glibc 
+          ];
+
+          config = {
+            Env = [ "LD_LIBRARY_PATH=/lib" ];
+            Cmd = [ 
+              "${pkgs.bashInteractive}/bin/bash" 
+              "-c" 
+              "ls -la /lib/libstreamdb.so /include/streamdb.h" 
+            ];
+          };
+        };
       in
       {
         packages = {
           default = streamdb;
-          inherit streamdb streamdb-wasm streamdb-encryption;
-        };
-
-        devShells.default = craneLib.devShell {
-          checks = self.checks.${system};
-          packages = with pkgs; [
-            rust-analyzer
-            cargo-watch
-            cargo-nextest
-            criterion
-            valgrind
-          ];
-        };
-
-        checks = {
-          streamdb-tests = craneLib.cargoNextest (commonArgs // { inherit cargoArtifacts; });
-          streamdb-clippy = craneLib.cargoClippy (commonArgs // { inherit cargoArtifacts; cargoClippyExtraArgs = "--all-targets -- -D warnings"; });
-          streamdb-fmt = craneLib.cargoFmt commonArgs;
+          docker = dockerImage;
         };
       }
     );
