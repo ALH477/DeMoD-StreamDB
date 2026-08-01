@@ -262,13 +262,25 @@ impl StreamDb {
         
         // Write value to backend
         let id = self.backend.write(value)?;
-        
-        // Update trie
-        {
+
+        // Update trie, capturing any superseded document ID
+        let old_id = {
             let mut trie = self.trie.write();
+            let old = trie.get(key);
             *trie = trie.insert(key, id);
+            old
+        };
+
+        // Reclaim the superseded document so updates don't leak storage.
+        // Best-effort: a failure leaves an orphan that compact() reclaims
+        // (it filters the index by trie-referenced IDs). Same transient-
+        // NotFound race window for concurrent readers as delete().
+        if let Some(old) = old_id {
+            if let Err(e) = self.backend.delete(old) {
+                warn!("failed to delete superseded document {}: {}", old, e);
+            }
         }
-        
+
         // Update cache
         {
             let mut cache = self.cache.lock();
@@ -672,12 +684,30 @@ mod tests {
     #[test]
     fn test_update() {
         let db = StreamDb::open_memory().unwrap();
-        
+
         db.insert(b"key", b"value1").unwrap();
         assert_eq!(db.get(b"key").unwrap(), Some(b"value1".to_vec()));
-        
+
         db.insert(b"key", b"value2").unwrap();
         assert_eq!(db.get(b"key").unwrap(), Some(b"value2".to_vec()));
+    }
+
+    /// Updating a key must not leak the superseded document: backend
+    /// total_size reflects only live documents.
+    #[test]
+    fn test_update_reclaims_superseded_document() {
+        let db = StreamDb::open_memory().unwrap();
+
+        db.insert(b"key", b"1234567890").unwrap();
+        db.insert(b"key", b"1234567890").unwrap();
+        db.insert(b"key", b"1234567890").unwrap();
+
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.key_count, 1);
+        assert_eq!(
+            stats.total_size, 10,
+            "superseded documents leaked in the backend"
+        );
     }
     
     #[test]

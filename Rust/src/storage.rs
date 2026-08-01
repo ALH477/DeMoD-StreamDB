@@ -527,6 +527,16 @@ impl FileBackend {
         let mut docs_guard = self.documents.write();
         let mut file = self.file.lock();
 
+        // Documents referenced by the committed trie. Anything else in the
+        // index is an orphan (superseded update whose cleanup failed, or a
+        // delete that errored mid-way) and is reclaimed here.
+        let mut live_ids: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::with_capacity(trie.len());
+        trie.for_each(&mut |_, id| {
+            live_ids.insert(id);
+            true
+        });
+
         let tmp_path = {
             let mut p = self.path.clone().into_os_string();
             p.push(".compact");
@@ -548,6 +558,9 @@ impl FileBackend {
         let mut offset = DATA_START;
 
         for (id, meta) in docs_guard.iter() {
+            if !live_ids.contains(id) {
+                continue; // orphan: reclaim by omission
+            }
             let mut data = vec![0u8; meta.size as usize];
             file.seek(SeekFrom::Start(meta.offset))?;
             file.read_exact(&mut data)?;
@@ -1398,7 +1411,10 @@ mod tests {
         let deleter = thread::spawn(move || {
             thread::sleep(Duration::from_millis(5));
             for id in &doomed_ids {
-                b2.delete(*id).unwrap();
+                // NotFound is fine: compact() also reclaims trie-unreferenced
+                // documents, and the trie being compacted excludes these —
+                // a tie between delete and GC honours the contract either way.
+                let _ = b2.delete(*id);
             }
         });
 
@@ -1503,5 +1519,34 @@ mod tests {
         let (backend, _trie) = FileBackend::open(&path, &cfg).unwrap();
         let id = backend.write(b"data").unwrap();
         assert_eq!(backend.read(id).unwrap(), b"data");
+    }
+
+    /// Documents not referenced by the committed trie (superseded updates
+    /// whose cleanup failed) are reclaimed by compaction.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn compact_reclaims_orphaned_documents() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("orphan.db");
+
+        let (backend, trie) = FileBackend::open(&path, &Config::default()).unwrap();
+
+        // Orphan: written, never referenced by the trie.
+        let orphan = backend.write(b"orphan payload").unwrap();
+        // Live: written and referenced.
+        let live = backend.write(b"live payload").unwrap();
+        let trie = trie.insert(b"live", live);
+        backend.flush(&trie).unwrap();
+        assert_eq!(backend.read(orphan).unwrap(), b"orphan payload");
+
+        backend.compact(&trie).unwrap();
+
+        assert!(
+            backend.read(orphan).is_err(),
+            "orphaned document survived compaction"
+        );
+        assert_eq!(backend.read(live).unwrap(), b"live payload");
     }
 }
