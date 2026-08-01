@@ -1,9 +1,13 @@
 /*
  * StreamDB Test Suite
- * 
+ *
  * Copyright (C) 2025 DeMoD LLC
  * Licensed under LGPL-2.1
  */
+
+#if !defined(_WIN32) && !defined(_WIN64)
+    #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "streamdb.h"
 #include "streamdb_wrapper.h"
@@ -523,6 +527,301 @@ TEST(version) {
 }
 
 /* ============================================================================
+ * v3 Format Tests
+ * ============================================================================ */
+
+TEST(update_reclaims_superseded) {
+    StreamDB* db = streamdb_init(NULL, 0);
+    ASSERT_NOT_NULL(db);
+
+    streamdb_insert(db, (const unsigned char*)"key", 3, "1234567890", 10);
+    streamdb_insert(db, (const unsigned char*)"key", 3, "1234567890", 10);
+    streamdb_insert(db, (const unsigned char*)"key", 3, "1234567890", 10);
+
+    StreamDBStats stats;
+    streamdb_get_stats(db, &stats);
+    ASSERT_EQ(stats.key_count, 1);
+    ASSERT_EQ(stats.total_size, 10);  /* superseded docs reclaimed */
+
+    streamdb_free(db);
+    return 0;
+}
+
+TEST(persistence_roundtrip_many) {
+    const char* path = "/tmp/streamdb_test_many.dat";
+    remove(path);
+
+    const int COUNT = 200;
+    const int SIZE = 4096;
+    unsigned char* value = (unsigned char*)malloc(SIZE);
+    ASSERT_NOT_NULL(value);
+
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        for (int i = 0; i < COUNT; i++) {
+            memset(value, i % 251, SIZE);
+            char key[32];
+            snprintf(key, sizeof(key), "%d.blob", i);
+            ASSERT_EQ(streamdb_insert(db, (const unsigned char*)key, strlen(key),
+                                      value, SIZE), STREAMDB_OK);
+        }
+        ASSERT_EQ(streamdb_flush(db), STREAMDB_OK);
+        streamdb_free(db);
+    }
+
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        for (int i = 0; i < COUNT; i++) {
+            char key[32];
+            snprintf(key, sizeof(key), "%d.blob", i);
+            size_t size = 0;
+            unsigned char* got = (unsigned char*)streamdb_get(
+                db, (const unsigned char*)key, strlen(key), &size);
+            ASSERT_NOT_NULL(got);
+            ASSERT_EQ(size, (size_t)SIZE);
+            for (int j = 0; j < SIZE; j++) {
+                ASSERT(got[j] == (unsigned char)(i % 251));
+            }
+            free(got);
+        }
+        /* Suffix index survived the reopen */
+        StreamDBResult* r = streamdb_suffix_search(db, (const unsigned char*)".blob", 5);
+        int count = 0;
+        for (StreamDBResult* it = r; it; it = it->next) count++;
+        ASSERT_EQ(count, COUNT);
+        streamdb_free_results(r);
+        streamdb_free(db);
+    }
+
+    free(value);
+    remove(path);
+    return 0;
+}
+
+TEST(compact_reclaims_space) {
+    const char* path = "/tmp/streamdb_test_compact.dat";
+    remove(path);
+    unsigned char value[2048];
+
+    long before;
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        for (int i = 0; i < 60; i++) {
+            memset(value, i, sizeof(value));
+            char key[32];
+            snprintf(key, sizeof(key), "%d.doc", i);
+            ASSERT_EQ(streamdb_insert(db, (const unsigned char*)key, strlen(key),
+                                      value, sizeof(value)), STREAMDB_OK);
+            if (i % 3 != 0) {
+                ASSERT_EQ(streamdb_delete(db, (const unsigned char*)key, strlen(key)),
+                          STREAMDB_OK);
+            }
+            /* Flush every round so superseded commits pile up. */
+            ASSERT_EQ(streamdb_flush(db), STREAMDB_OK);
+        }
+
+        FILE* fp = fopen(path, "rb");
+        ASSERT_NOT_NULL(fp);
+        fseek(fp, 0, SEEK_END);
+        before = ftell(fp);
+        fclose(fp);
+
+        ASSERT_EQ(streamdb_compact(db), STREAMDB_OK);
+
+        /* Live keys readable through the same handle */
+        for (int i = 0; i < 60; i += 3) {
+            char key[32];
+            snprintf(key, sizeof(key), "%d.doc", i);
+            size_t size = 0;
+            unsigned char* got = (unsigned char*)streamdb_get(
+                db, (const unsigned char*)key, strlen(key), &size);
+            ASSERT_NOT_NULL(got);
+            ASSERT_EQ(size, sizeof(value));
+            ASSERT(got[0] == (unsigned char)i);
+            free(got);
+        }
+        streamdb_free(db);
+    }
+
+    FILE* fp = fopen(path, "rb");
+    ASSERT_NOT_NULL(fp);
+    fseek(fp, 0, SEEK_END);
+    long after = ftell(fp);
+    fclose(fp);
+    ASSERT(after < before);
+
+    /* And after reopening the rewritten file */
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        size_t size = 0;
+        void* gone = streamdb_get(db, (const unsigned char*)"1.doc", 5, &size);
+        ASSERT_NULL(gone);
+        unsigned char* got = (unsigned char*)streamdb_get(
+            db, (const unsigned char*)"0.doc", 5, &size);
+        ASSERT_NOT_NULL(got);
+        ASSERT_EQ(size, sizeof(value));
+        free(got);
+        streamdb_free(db);
+    }
+
+    remove(path);
+    return 0;
+}
+
+#ifndef _WIN32
+#include <unistd.h>
+
+/* Crash between appending a commit's data and writing its header: the
+ * truncated file still carries the newer header slot, which points past
+ * EOF. It must be rejected in favour of the previous commit. */
+TEST(crash_torn_flush_recovers_previous_commit) {
+    const char* path = "/tmp/streamdb_test_crash.dat";
+    remove(path);
+
+    long after_commit1;
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        ASSERT_EQ(streamdb_insert(db, (const unsigned char*)"survivor", 8,
+                                  "first", 6), STREAMDB_OK);
+        ASSERT_EQ(streamdb_flush(db), STREAMDB_OK);
+        streamdb_free(db);
+    }
+    {
+        FILE* fp = fopen(path, "rb");
+        ASSERT_NOT_NULL(fp);
+        fseek(fp, 0, SEEK_END);
+        after_commit1 = ftell(fp);
+        fclose(fp);
+    }
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        ASSERT_EQ(streamdb_insert(db, (const unsigned char*)"casualty", 8,
+                                  "second", 7), STREAMDB_OK);
+        ASSERT_EQ(streamdb_flush(db), STREAMDB_OK);
+        streamdb_free(db);
+    }
+
+    /* Lose everything commit 2 appended, keeping both header slots. */
+    ASSERT_EQ(truncate(path, after_commit1), 0);
+
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+
+        size_t size = 0;
+        char* v = (char*)streamdb_get(db, (const unsigned char*)"survivor", 8, &size);
+        ASSERT_NOT_NULL(v);
+        ASSERT_STR_EQ(v, "first");
+        free(v);
+
+        void* gone = streamdb_get(db, (const unsigned char*)"casualty", 8, &size);
+        ASSERT_NULL(gone);
+
+        /* Recovered database must still be usable. */
+        ASSERT_EQ(streamdb_insert(db, (const unsigned char*)"after", 5,
+                                  "third", 6), STREAMDB_OK);
+        ASSERT_EQ(streamdb_flush(db), STREAMDB_OK);
+        streamdb_free(db);
+    }
+    {
+        StreamDB* db = streamdb_init(path, 0);
+        ASSERT_NOT_NULL(db);
+        size_t size = 0;
+        char* v = (char*)streamdb_get(db, (const unsigned char*)"after", 5, &size);
+        ASSERT_NOT_NULL(v);
+        ASSERT_STR_EQ(v, "third");
+        free(v);
+        streamdb_free(db);
+    }
+
+    remove(path);
+    return 0;
+}
+
+/* Two handles on the same path would interleave appends and corrupt the
+ * store: a second init while the first is alive must fail. */
+TEST(double_open_fails) {
+    const char* path = "/tmp/streamdb_test_lock.dat";
+    remove(path);
+
+    StreamDB* db1 = streamdb_init(path, 0);
+    ASSERT_NOT_NULL(db1);
+
+    StreamDB* db2 = streamdb_init(path, 0);
+    ASSERT_NULL(db2);
+
+    /* First handle still usable */
+    ASSERT_EQ(streamdb_insert(db1, (const unsigned char*)"k", 1, "v", 2), STREAMDB_OK);
+    streamdb_free(db1);
+
+    /* And a fresh open succeeds after the first is closed */
+    StreamDB* db3 = streamdb_init(path, 0);
+    ASSERT_NOT_NULL(db3);
+    streamdb_free(db3);
+
+    remove(path);
+    return 0;
+}
+#endif /* !_WIN32 */
+
+/* Cross-compat: read a database file written by the RUST implementation.
+ * Skipped unless STREAMDB_RUST_FIXTURE points at such a file (the
+ * `crosscheck` make target sets it up). */
+TEST(cross_read_rust_fixture) {
+    const char* path = getenv("STREAMDB_RUST_FIXTURE");
+    if (!path || !*path) {
+        printf("(skipped: STREAMDB_RUST_FIXTURE not set) ");
+        return 0;
+    }
+
+    StreamDB* db = streamdb_init(path, 0);
+    ASSERT_NOT_NULL(db);
+
+    size_t size = 0;
+    char* a = (char*)streamdb_get(db, (const unsigned char*)"key:a", 5, &size);
+    ASSERT_NOT_NULL(a);
+    ASSERT_EQ(size, 7);
+    ASSERT(memcmp(a, "value-a", 7) == 0);
+    free(a);
+
+    char* b = (char*)streamdb_get(db, (const unsigned char*)"key:b", 5, &size);
+    ASSERT_NOT_NULL(b);
+    ASSERT_EQ(size, 8);
+    ASSERT(memcmp(b, "value-bb", 8) == 0);
+    free(b);
+
+    /* "key:a"/"key:b" share no non-empty suffix; check each tail. */
+    StreamDBResult* r = streamdb_suffix_search(db, (const unsigned char*)":a", 2);
+    int count = 0;
+    for (StreamDBResult* it = r; it; it = it->next) {
+        count++;
+        ASSERT(it->key_len == 5);
+        ASSERT(memcmp(it->key, "key:a", 5) == 0);
+    }
+    ASSERT_EQ(count, 1);
+    streamdb_free_results(r);
+
+    r = streamdb_suffix_search(db, (const unsigned char*)":b", 2);
+    count = 0;
+    for (StreamDBResult* it = r; it; it = it->next) {
+        count++;
+        ASSERT(it->key_len == 5);
+        ASSERT(memcmp(it->key, "key:b", 5) == 0);
+    }
+    ASSERT_EQ(count, 1);
+    streamdb_free_results(r);
+
+    streamdb_free(db);
+    return 0;
+}
+
+/* ============================================================================
  * Main
  * ============================================================================ */
 
@@ -575,6 +874,16 @@ int main(void) {
     printf("\nUtilities:\n");
     RUN_TEST(strerror);
     RUN_TEST(version);
+
+    printf("\nv3 Format:\n");
+    RUN_TEST(update_reclaims_superseded);
+    RUN_TEST(persistence_roundtrip_many);
+    RUN_TEST(compact_reclaims_space);
+#ifndef _WIN32
+    RUN_TEST(crash_torn_flush_recovers_previous_commit);
+    RUN_TEST(double_open_fails);
+#endif
+    RUN_TEST(cross_read_rust_fixture);
     
     printf("\n============================================================\n");
     printf("Results: %d passed, %d failed\n", passed, failed);

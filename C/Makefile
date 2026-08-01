@@ -46,7 +46,7 @@ endif
 INCLUDES = -I$(INCDIR)
 
 # Targets
-.PHONY: all clean test debug static shared install help
+.PHONY: all clean test debug static shared install help crosscheck
 
 all: static shared
 
@@ -78,9 +78,15 @@ $(SHARED_LIB): $(LIB_OBJS) | $(LIBDIR)
 	$(CC) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built shared library: $@"
 
+# Cross-compat fixture writer (C writes v3, Rust reads it back)
+CROSS_WRITER = $(BUILDDIR)/c_writer
+
 # Test binary — link the static library by path so a stale shared library
 # in $(LIBDIR) is never preferred at link/runtime.
 $(TEST_BIN): $(TEST_SRCS) $(STATIC_LIB) | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(LDFLAGS)
+
+$(CROSS_WRITER): $(TESTDIR)/c_writer.c $(STATIC_LIB) | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(LDFLAGS)
 
 # Run tests
@@ -89,6 +95,16 @@ test: $(TEST_BIN)
 	@echo "Running tests..."
 	@echo ""
 	@./$(TEST_BIN)
+
+# Cross-implementation compatibility check (requires cargo):
+#   Rust writes a fixture -> C reads it (in the C test suite)
+#   C writes a fixture    -> Rust reads it (in the Rust test suite)
+crosscheck: $(TEST_BIN) $(CROSS_WRITER)
+	cd ../Rust && cargo test --features persistence --test format_fixture
+	STREAMDB_RUST_FIXTURE=/tmp/streamdb-rust-fixture.db ./$(TEST_BIN)
+	$(CROSS_WRITER) /tmp/streamdb-c-fixture.db
+	cd ../Rust && STREAMDB_C_FIXTURE=/tmp/streamdb-c-fixture.db \
+		cargo test --features persistence --test cross_compat -- --nocapture
 
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)

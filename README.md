@@ -12,13 +12,14 @@ StreamDb is a lightweight, embedded key-value store optimized for storing and re
 Two **independent** implementations exist under the same project umbrella:
 
 - **Rust version** (`Rust/`) — the reference implementation: crash-safe append-only persistence (v3 format), LRU caching, memory-mapped reads, checksums, compaction, C FFI bindings
-- **C version** (`C/`) — minimal, highly portable sibling for constrained/legacy environments, pure C11 with zero dependencies and a background auto-flush thread
+- **C version** (`C/`) — minimal, portable sibling for constrained/legacy environments, pure C11 with zero dependencies, a background auto-flush thread, and the same v3 on-disk format
 
-> **⚠ The two on-disk formats are incompatible.** The Rust v3 format (dual
-> CRC'd header slots, append-only, per-document CRC32) is the reference design;
-> the C format is a native-endian recursive trie dump without checksums or
-> fsync. Files cannot be exchanged between the implementations. See
-> `Rust/README.md` and `C/README.md` for the respective durability contracts.
+> **The two implementations share the v3 on-disk format** (since C v3.0.0):
+> files are exchangeable in both directions — dual CRC'd header slots,
+> append-only document records with per-document CRC32, UUID-sorted index.
+> The pre-v3 C format (no checksums, no fsync, native-endian) is gone and
+> its files are rejected on open. See `Rust/README.md` and `C/README.md`
+> for the respective durability contracts.
 
 Both draw inspiration from the same clean-room design concepts (originally explored in Iain Ballard’s public BSD-licensed C# prototype), but are independently written with no reverse engineering of any proprietary format. The project is licensed under **LGPLv3** (Rust) / **LGPLv2.1+** (C) to support broad FOSS and commercial adoption.
 
@@ -28,15 +29,15 @@ Both draw inspiration from the same clean-room design concepts (originally explo
 |----------------------------------|------------------------------------------------|-------------------------------------|
 | **Primary index**                | Reverse Trie (`im::OrdMap`)                    | Reverse Trie (array[256] children)  |
 | **Suffix search**                | Yes — O(k + m), plus bounded variant           | Yes — O(k + m)                      |
-| **Max value size**               | 256 MB                                         | ~2 GB (platform `size_t` limited)   |
+| **Max value size**               | 256 MB                                         | 4 GB (u32 format field)             |
 | **Thread safety**                | Multiple readers, serialized writers           | Recursive mutex (all serialized)    |
-| **Persistence**                  | Append-only v3, dual CRC'd commit slots        | Whole-DB temp-file + rename         |
-| **Crash recovery**               | Torn-write fallback to previous commit         | No (no fsync, no checksums)         |
-| **Space reclamation**            | `compact()`                                    | No                                  |
-| **Double-open guard**            | Exclusive advisory file lock                   | No                                  |
-| **Auto-flush**                   | No (call `flush()` explicitly)                 | Yes (background thread)             |
+| **Persistence**                  | Append-only v3, dual CRC'd commit slots        | Same v3 format, same commit protocol    |
+| **Crash recovery**               | Torn-write fallback to previous commit         | Torn-write fallback to previous commit  |
+| **Space reclamation**            | `compact()`                                    | `streamdb_compact()`                    |
+| **Double-open guard**            | Exclusive advisory file lock                   | Exclusive advisory file lock (POSIX)    |
+| **Auto-flush**                   | No (call `flush()` explicitly)                 | Yes (background thread)                 |
 | **Caching**                      | LRU                                            | No                                  |
-| **Checksum on read**             | CRC32 per document (can be disabled)           | No                                  |
+| **Checksum on read**             | CRC32 per document (can be disabled)           | CRC32 per document (always on)      |
 | **WASM / no_std support**        | wasm32 target (no mmap/file-lock)              | Native (very small footprint)       |
 | **FFI bindings**                 | Comprehensive C API (`ffi` feature)            | Native C API                        |
 | **Binary size (release)**        | ~few MB (with deps)                            | ~10–50 KB                           |
@@ -128,7 +129,7 @@ Both implementations are functional and production-viable for many embedded/real
 
 **C-specific:**
 
-- Port the v3 commit protocol (checksums, fsync, dual header slots)
+- ~~Port the v3 commit protocol~~ (done in v3.0.0 — files now exchangeable with Rust)
 - Optional compression (miniz / lz4)
 - Read-write lock for better read concurrency
 - Memory-mapped I/O mode

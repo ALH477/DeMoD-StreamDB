@@ -77,10 +77,10 @@ extern "C" {
 #endif
 
 /* Version information */
-#define STREAMDB_VERSION_MAJOR 2
+#define STREAMDB_VERSION_MAJOR 3
 #define STREAMDB_VERSION_MINOR 0
 #define STREAMDB_VERSION_PATCH 0
-#define STREAMDB_VERSION_STRING "2.0.0"
+#define STREAMDB_VERSION_STRING "3.0.0"
 
 /* Configuration constants */
 #define STREAMDB_MAX_KEY_LEN 1024
@@ -274,12 +274,27 @@ void streamdb_free_results(StreamDBResult* results);
 
 /**
  * @brief Flush database to disk
- * 
+ *
  * @param db Database handle
  * @return STREAMDB_OK on success, STREAMDB_NOT_SUPPORTED for memory-only db,
  *         or error code on failure
  */
 StreamDBStatus streamdb_flush(StreamDB* db);
+
+/**
+ * @brief Rewrite the database file keeping only live documents
+ *
+ * Reclaims space from deleted documents, superseded updates, and superseded
+ * commit blobs (the store is append-only between compactions). Documents
+ * not referenced by the current trie are dropped. Writes a sibling temp
+ * file and renames atomically, so an interrupted compaction leaves the
+ * existing database untouched.
+ *
+ * @param db Database handle
+ * @return STREAMDB_OK on success, STREAMDB_NOT_SUPPORTED for memory-only db,
+ *         or error code on failure
+ */
+StreamDBStatus streamdb_compact(StreamDB* db);
 
 /**
  * @brief Request graceful shutdown of background threads
