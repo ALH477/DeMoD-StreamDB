@@ -99,17 +99,13 @@ impl Backend for MemoryBackend {
     fn write(&self, data: &[u8]) -> Result<Uuid> {
         let id = Uuid::new_v4();
         let size = data.len() as u64;
-        
+
+        // Every write creates a fresh document; key-level "update" happens at
+        // the StreamDb layer by pointing the key at a new ID.
         let mut docs = self.documents.write();
-        
-        // If updating, subtract old size
-        if let Some(old) = docs.get(&id) {
-            self.total_size.fetch_sub(old.len() as u64, Ordering::Relaxed);
-        }
-        
         docs.insert(id, data.to_vec());
         self.total_size.fetch_add(size, Ordering::Relaxed);
-        
+
         Ok(id)
     }
     
@@ -277,6 +273,10 @@ pub struct FileBackend {
     next_offset: AtomicU64,
     /// Sequence number of the last committed header.
     seq: AtomicU64,
+    /// Serialises `flush()`: two concurrent commits must not load the same
+    /// `seq` and both write to the same header slot, the second clobbering
+    /// the first.
+    flush_lock: Mutex<()>,
     /// Backing file path, needed to rewrite it during [`FileBackend::compact`].
     path: std::path::PathBuf,
     config: Config,
@@ -331,6 +331,7 @@ impl FileBackend {
             total_size: AtomicU64::new(0),
             next_offset: AtomicU64::new(DATA_START),
             seq: AtomicU64::new(0),
+            flush_lock: Mutex::new(()),
             path: path.to_path_buf(),
             config: config.clone(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -739,6 +740,11 @@ impl Backend for FileBackend {
     /// The previous commit's trie/index become garbage — space is reclaimed by
     /// [`FileBackend::compact`], not here.
     fn flush(&self, trie: &Trie) -> Result<()> {
+        // Serialise commits: two concurrent flushes must not load the same
+        // `seq` and both write header slot `(seq+1) % HEADER_SLOTS`, the
+        // second clobbering the first.
+        let _flush_guard = self.flush_lock.lock();
+
         let trie_data = bincode::serialize(trie)?;
         let trie_crc = compute_checksum(&trie_data);
 
@@ -1444,5 +1450,38 @@ mod tests {
 
         drop(backend);
         let (_b2, _t2) = FileBackend::open(&path, &Config::default()).unwrap();
+    }
+
+    /// Concurrent flushes must be serialised into monotonic commits: the
+    /// file must load cleanly afterwards no matter how they interleaved.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn concurrent_flushes_commit_cleanly() {
+        use std::sync::Arc;
+        use std::thread;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("flushrace.db");
+        let (backend, trie) = FileBackend::open(&path, &Config::default()).unwrap();
+        let backend = Arc::new(backend);
+
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let b = Arc::clone(&backend);
+            let t = trie.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..10 {
+                    b.flush(&t).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(backend);
+
+        // Must load cleanly; exactly one valid newest commit.
+        let (_b, _t) = FileBackend::open(&path, &Config::default()).unwrap();
     }
 }
