@@ -23,6 +23,8 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 #[cfg(feature = "persistence")]
 use crc32fast::Hasher as Crc32Hasher;
+#[cfg(all(feature = "persistence", not(target_arch = "wasm32")))]
+use fs2::FileExt;
 
 /// Database statistics
 #[derive(Debug, Clone, Default)]
@@ -307,7 +309,19 @@ impl FileBackend {
             .write(true)
             .create(true)
             .open(path)?;
-        
+
+        // Exclusive advisory lock: two handles on the same path keep
+        // independent `next_offset`s and would interleave appends, silently
+        // corrupting the store. Held for the lifetime of the `File`.
+        #[cfg(not(target_arch = "wasm32"))]
+        file.try_lock_exclusive().map_err(|e| {
+            Error::ResourceLimit(format!(
+                "cannot lock {} (already open in this or another process?): {}",
+                path.display(),
+                e
+            ))
+        })?;
+
         let metadata = file.metadata()?;
         let file_size = metadata.len();
         
@@ -593,7 +607,19 @@ impl FileBackend {
         // contents were fully synced.
         sync_parent_dir(&self.path)?;
 
-        *file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        *file = {
+            let new_file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            // Re-acquire the exclusive lock on the new inode before swapping.
+            #[cfg(not(target_arch = "wasm32"))]
+            new_file.try_lock_exclusive().map_err(|e| {
+                Error::ResourceLimit(format!(
+                    "cannot re-lock {} after compaction: {}",
+                    self.path.display(),
+                    e
+                ))
+            })?;
+            new_file
+        };
         *docs_guard = new_docs;
         self.total_size.store(total_size, Ordering::SeqCst);
         self.next_offset.store(header.data_end, Ordering::SeqCst);
@@ -1391,5 +1417,32 @@ mod tests {
             let id = trie3.get(format!("{i}.x").as_bytes()).unwrap();
             assert!(backend.read(id).unwrap().iter().all(|&b| b == i as u8));
         }
+    }
+
+    /// Two handles on the same path keep independent `next_offset`s and
+    /// would interleave appends, corrupting the store: a second `open`
+    /// while the first is alive must fail, and succeed again after drop.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn second_open_of_same_path_fails() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+
+        let (backend, _trie) = FileBackend::open(&path, &Config::default()).unwrap();
+
+        match FileBackend::open(&path, &Config::default()) {
+            Err(Error::ResourceLimit(_)) => {}
+            Err(e) => panic!("expected ResourceLimit, got: {e}"),
+            Ok(_) => panic!("double open must fail while first handle is alive"),
+        }
+
+        // First handle still usable after the rejected attempt.
+        let id = backend.write(b"still alive").unwrap();
+        assert_eq!(backend.read(id).unwrap(), b"still alive");
+
+        drop(backend);
+        let (_b2, _t2) = FileBackend::open(&path, &Config::default()).unwrap();
     }
 }
