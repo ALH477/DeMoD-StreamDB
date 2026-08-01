@@ -1,4 +1,4 @@
-# StreamDB Review Hardening Plan
+# StreamDB Review Hardening Plan by Kimi K3 Via Ollama
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
