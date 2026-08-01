@@ -301,10 +301,10 @@ impl StreamDb {
         
         debug!("Getting key: {:?}", key);
         
-        // Check cache first
+        // Check cache first (zero-alloc: LruCache<Vec<u8>, _> borrows [u8])
         let id = {
             let mut cache = self.cache.lock();
-            if let Some(&id) = cache.get(&key.to_vec()) {
+            if let Some(&id) = cache.get(key) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 Some(id)
             } else {
@@ -349,7 +349,7 @@ impl StreamDb {
         // Check cache first
         {
             let mut cache = self.cache.lock();
-            if cache.get(&key.to_vec()).is_some() {
+            if cache.get(key).is_some() {
                 return Ok(true);
             }
         }
@@ -388,7 +388,7 @@ impl StreamDb {
         // Remove from cache
         {
             let mut cache = self.cache.lock();
-            cache.pop(&key.to_vec());
+            cache.pop(key);
         }
         
         // Delete from backend
@@ -457,18 +457,26 @@ impl StreamDb {
     /// This is automatically called on drop, but can be called manually
     /// to ensure durability at specific points.
     pub fn flush(&self) -> Result<()> {
-        if !self.dirty.load(Ordering::Acquire) {
+        // Consume the dirty flag up front: writes set it only after their
+        // trie update, so everything consumed here is included in the
+        // snapshot below; anything racing the commit re-sets the flag and
+        // is picked up by the next flush.
+        if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        
+
         info!("Flushing database");
-        
-        // Serialize and write trie
-        let trie = self.trie.read();
-        self.backend.flush(&trie)?;
-        
-        self.dirty.store(false, Ordering::Release);
-        
+
+        // Snapshot the persistent trie (O(1) structural-sharing clone) and
+        // release the read lock before serialising + fsyncing, so writers
+        // are not blocked for the duration of the commit.
+        let snapshot = { self.trie.read().clone() };
+        if let Err(e) = self.backend.flush(&snapshot) {
+            // Commit failed: nothing was made durable, still dirty.
+            self.dirty.store(true, Ordering::Release);
+            return Err(e);
+        }
+
         Ok(())
     }
     
@@ -684,5 +692,43 @@ mod tests {
         
         // Verify count
         assert_eq!(db.len(), 1000);
+    }
+
+    /// A flush racing concurrent inserts must never lose data: anything
+    /// written before the final flush must be durable after reopen.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn flush_racing_inserts_loses_nothing() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.db");
+
+        let db = Arc::new(StreamDb::open(&path, Config::default()).unwrap());
+        for i in 0..500 {
+            db.insert(format!("k{i}").as_bytes(), &[0u8; 256]).unwrap();
+        }
+
+        let db2 = Arc::clone(&db);
+        let writer = thread::spawn(move || {
+            for i in 500..600 {
+                db2.insert(format!("k{i}").as_bytes(), &[1u8; 256]).unwrap();
+            }
+        });
+        // Races the writer above; may or may not include those keys.
+        db.flush().unwrap();
+        writer.join().unwrap();
+        // This flush must commit everything the racing flush missed.
+        db.flush().unwrap();
+        drop(db);
+
+        let db = StreamDb::open(&path, Config::default()).unwrap();
+        for i in 0..600 {
+            assert!(
+                db.get(format!("k{i}").as_bytes()).unwrap().is_some(),
+                "k{i} lost"
+            );
+        }
     }
 }
