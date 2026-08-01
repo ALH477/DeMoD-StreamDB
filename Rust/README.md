@@ -16,7 +16,9 @@ A lightweight, thread-safe embedded key-value database implemented in Rust, usin
 | **Binary keys** | Supports arbitrary byte sequences, not just UTF-8 strings |
 | **Zero-copy reads** | Memory-mapped I/O when available |
 | **C FFI** | Safe C bindings for cross-language integration |
-| **Optional features** | Compression, encryption, async API |
+| **Crash-safe commits** | Dual CRC'd header slots, append-then-commit, torn-write recovery |
+| **Compaction** | `compact()` reclaims space from deleted docs and superseded commits |
+| **Single-opener guard** | Exclusive advisory file lock prevents two handles corrupting one file |
 
 ## Quick Start
 
@@ -77,16 +79,14 @@ fn main() -> Result<()> {
 |------|-------------|---------|
 | `std` | Enable standard library | ✓ |
 | `persistence` | File-based storage | ✓ |
-| `compression` | LZ4 value compression | ✗ |
-| `encryption` | AES-256-GCM encryption | ✗ |
-| `async` | Tokio async API | ✗ |
 | `ffi` | C FFI bindings | ✗ |
+| `cli` | `streamdb-cli` binary | ✗ |
 
 Enable features in `Cargo.toml`:
 
 ```toml
 [dependencies]
-streamdb = { version = "2.0", features = ["compression", "encryption"] }
+streamdb = { version = "2.0", features = ["ffi"] }
 ```
 
 ## Design
@@ -161,6 +161,69 @@ To prevent deadlocks, locks are always acquired in this order:
 1. `trie` (RwLock) — for index operations
 2. `cache` (Mutex) — for LRU cache updates
 3. `backend.documents` — for storage operations
+4. `backend.file` — for on-disk reads/writes (inside the file backend)
+
+`flush()` snapshots the persistent trie (an O(1) structural-sharing clone)
+and releases the trie lock before serialising and fsyncing, so writers are
+not blocked for the duration of a commit.
+
+## Durability
+
+**A write is durable exactly when `flush()` has returned `Ok`.** The file
+backend is append-only with an append-then-commit-header protocol:
+
+1. Document bytes are appended (size + CRC32 + payload).
+2. `flush()` appends the serialized trie and the document index past every
+   document, calls `sync_data`, and only then writes a fixed header slot
+   pointing at them, followed by `sync_all`.
+3. Two alternating 128-byte header slots carry monotonic commit sequence
+   numbers. On open, the newest slot whose magic, version, CRC, and
+   bounds checks pass wins; a torn or half-written newer commit falls back
+   to the previous one.
+
+Consequences:
+
+- A crash loses at most the unflushed tail. Anything `flush()` committed
+  survives.
+- Per-document CRC32s detect (not repair) corruption on read. CRC32 is not
+  cryptographic; this is a corruption detector, not a security boundary.
+- `compact()` rewrites the file into a sibling temp file and renames,
+  fsyncing the parent directory, so an interrupted compaction leaves the
+  existing database untouched.
+- Opening a path takes an exclusive advisory file lock (`flock`-style) for
+  the lifetime of the handle: a second opener gets
+  `Error::ResourceLimit` instead of silently corrupting the store.
+
+## Determinism
+
+- Document IDs are random (UUID v4). Identical workloads never produce
+  identical files, and tests must never assert on raw file bytes.
+- The document index is serialized sorted by UUID, so identical logical
+  state produces identical index bytes and header CRCs given identical IDs.
+- The trie's on-disk bytes depend on operation history (persistent B-tree
+  shape), not just the final key set. Correctness does not.
+- `suffix_search` returns matches in reversed-key byte order, **not**
+  lexicographic order. Sort client-side if display order matters.
+- Tests use a fixed-seed xorshift RNG (see `Rng` in `src/storage.rs`
+  tests) — reuse that pattern for reproducible fuzz runs.
+
+## On-disk format (v3)
+
+Version 3 is the append-then-commit-header layout described above. It is
+**not** readable by format v2, and v2 files are rejected on open: in v2,
+`flush()` wrote the trie over the first document's bytes, so any v2 file
+with at least one document is already corrupt. Rebuild v2 databases by
+exporting and re-importing their data.
+
+## Maintenance
+
+The store is append-only between compactions: deleted documents and every
+superseded trie/index commit stay on disk until `compact()` runs. On
+delete-heavy or flush-heavy workloads, call `compact()` periodically:
+
+```rust
+db.compact()?;  // blocks concurrent writers; reclaims dead space
+```
 
 ## C FFI
 

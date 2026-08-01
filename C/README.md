@@ -2,6 +2,23 @@
 
 A lightweight, thread-safe embedded key-value database implemented in C, using a reverse trie data structure for efficient suffix-based searches.
 
+> **⚠ Relationship to the Rust implementation (`../Rust`):** this C library is
+> an **independent implementation**, not a binding of the Rust crate, and its
+> on-disk format is **incompatible** with the Rust v3 format:
+>
+> - This C format is `"STDB"` + native-endian `int` version + a recursive trie
+>   dump using raw `int`/`size_t` fields. It is **not portable** across
+>   architectures with different `size_t` widths or endianness, has **no
+>   checksums**, and performs **no fsync** — the temp-file+rename is atomic at
+>   the VFS level but not crash-durable.
+> - The Rust v3 format (dual CRC'd header slots, append-only, per-document
+>   CRC32, `sync_data`-before-commit) is the reference design going forward.
+>   Files are **not exchangeable** between the two implementations, and the C
+>   loader will reject a Rust file (and vice versa).
+> - If you need crash safety, portability, or cross-language files, use the
+>   Rust implementation (or its FFI). This C implementation is suitable for
+>   single-platform, best-effort-persistence use.
+
 [![License: LGPL v2.1](https://img.shields.io/badge/License-LGPL_v2.1-blue.svg)](https://www.gnu.org/licenses/lgpl-2.1)
 [![C Standard](https://img.shields.io/badge/C-C11-blue.svg)](https://en.wikipedia.org/wiki/C11_(C_standard_revision))
 [![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](CHANGELOG.md)

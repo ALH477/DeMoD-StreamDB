@@ -78,9 +78,10 @@ $(SHARED_LIB): $(LIB_OBJS) | $(LIBDIR)
 	$(CC) $(SHARED_FLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built shared library: $@"
 
-# Test binary
+# Test binary — link the static library by path so a stale shared library
+# in $(LIBDIR) is never preferred at link/runtime.
 $(TEST_BIN): $(TEST_SRCS) $(STATIC_LIB) | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< -L$(LIBDIR) -lstreamdb $(LDFLAGS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(LDFLAGS)
 
 # Run tests
 test: $(TEST_BIN)

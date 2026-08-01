@@ -9,60 +9,69 @@
 
 StreamDb is a lightweight, embedded key-value store optimized for storing and retrieving binary streams (blobs) associated with string/binary paths/keys. It uses a **reverse trie** (suffix trie) index to enable efficient **suffix-based searches** — ideal for file-extension lookups, domain patterns, asset paths in game engines, IoT telemetry, messaging frameworks, and similar low-latency workloads.
 
-Two independent implementations exist under the same project umbrella:
+Two **independent** implementations exist under the same project umbrella:
 
-- **Rust version** — full-featured, high-performance edition with WAL, compression, async I/O, streaming reads, LRU caching, memory-mapped files, WASM support, and strong FFI bindings  
-- **C version** — minimal, highly portable sibling focused on embeddability in constrained/legacy environments (microcontrollers, no_std-like footprints, no Rust dependency)
+- **Rust version** (`Rust/`) — the reference implementation: crash-safe append-only persistence (v3 format), LRU caching, memory-mapped reads, checksums, compaction, C FFI bindings
+- **C version** (`C/`) — minimal, highly portable sibling for constrained/legacy environments, pure C11 with zero dependencies and a background auto-flush thread
+
+> **⚠ The two on-disk formats are incompatible.** The Rust v3 format (dual
+> CRC'd header slots, append-only, per-document CRC32) is the reference design;
+> the C format is a native-endian recursive trie dump without checksums or
+> fsync. Files cannot be exchanged between the implementations. See
+> `Rust/README.md` and `C/README.md` for the respective durability contracts.
 
 Both draw inspiration from the same clean-room design concepts (originally explored in Iain Ballard’s public BSD-licensed C# prototype), but are independently written with no reverse engineering of any proprietary format. The project is licensed under **LGPLv3** (Rust) / **LGPLv2.1+** (C) to support broad FOSS and commercial adoption.
 
 ## Key Features
 
-| Feature                          | Rust Edition                          | C Edition                           |
-|----------------------------------|---------------------------------------|-------------------------------------|
-| **Primary index**                | Reverse Trie (`im::OrdMap`)           | Reverse Trie (array[256] children)  |
-| **Suffix search**                | Yes — O(k + m)                        | Yes — O(k + m)                      |
-| **Max value size**               | 256 MB (configurable)                 | ~2 GB (platform `size_t` limited)   |
-| **Thread safety**                | Multiple readers, serialized writers  | Recursive mutex (all serialized)    |
-| **Persistence**                  | Write-ahead logging (`okaywal`)       | Atomic temp-file + rename           |
-| **Compression**                  | Snappy (optional)                     | Not yet (planned)                   |
-| **Async / Streaming**            | `get_async`, `get_stream`             | No (planned for v3)                 |
-| **Caching**                      | LRU + prefetching                     | No (simple hot-path cache possible) |
-| **Quick mode** (skip CRC)        | Yes (~10× faster reads)               | No                                  |
-| **WASM / no_std support**        | Yes (with fallback backend)           | Native (very small footprint)       |
-| **FFI bindings**                 | Comprehensive C API                   | Native C API                        |
-| **Binary size (release)**        | ~few MB (with deps)                   | ~10–50 KB                           |
-| **Dependencies**                 | Moderate (im, okaywal, snappy, …)     | None (pure C11 + pthreads)          |
+| Feature                          | Rust Edition                                   | C Edition                           |
+|----------------------------------|------------------------------------------------|-------------------------------------|
+| **Primary index**                | Reverse Trie (`im::OrdMap`)                    | Reverse Trie (array[256] children)  |
+| **Suffix search**                | Yes — O(k + m), plus bounded variant           | Yes — O(k + m)                      |
+| **Max value size**               | 256 MB                                         | ~2 GB (platform `size_t` limited)   |
+| **Thread safety**                | Multiple readers, serialized writers           | Recursive mutex (all serialized)    |
+| **Persistence**                  | Append-only v3, dual CRC'd commit slots        | Whole-DB temp-file + rename         |
+| **Crash recovery**               | Torn-write fallback to previous commit         | No (no fsync, no checksums)         |
+| **Space reclamation**            | `compact()`                                    | No                                  |
+| **Double-open guard**            | Exclusive advisory file lock                   | No                                  |
+| **Auto-flush**                   | No (call `flush()` explicitly)                 | Yes (background thread)             |
+| **Caching**                      | LRU                                            | No                                  |
+| **Checksum on read**             | CRC32 per document (can be disabled)           | No                                  |
+| **WASM / no_std support**        | wasm32 target (no mmap/file-lock)              | Native (very small footprint)       |
+| **FFI bindings**                 | Comprehensive C API (`ffi` feature)            | Native C API                        |
+| **Binary size (release)**        | ~few MB (with deps)                            | ~10–50 KB                           |
+| **Dependencies**                 | Moderate (im, parking_lot, lru, …)             | None (pure C11 + pthreads)          |
 
 ## When to choose which version?
 
-- Use **Rust** if you want: maximum performance, modern features (async, compression, WAL durability), WASM/browser support, or you're already in a Rust project (Bevy, DCF, Tokio-based systems).
-- Use **C** if you need: minimal footprint, no external dependencies, easy integration into legacy C/C++ codebases, or deployment on deeply embedded platforms without a Rust toolchain.
+- Use **Rust** if you want: crash safety, data-integrity checksums, space reclamation, a guaranteed on-disk format, or you're already in a Rust project.
+- Use **C** if you need: minimal footprint, no external dependencies, background auto-flush, easy integration into legacy C/C++ codebases, or deployment on deeply embedded platforms without a Rust toolchain — and can accept best-effort persistence.
 
 ## Quick Start – Rust
 
 ```toml
 # Cargo.toml
 [dependencies]
-streamdb = "0.1"   # once published
+streamdb = "2.0"
 ```
 
 ```rust
-use streamdb::{Config, StreamDb};
+use streamdb::{Config, Result, StreamDb};
 
-fn main() -> Result<(), streamdb::StreamDbError> {
-    let mut db = StreamDb::open("assets.db", Config::default())?;
-    db.set_quick_mode(true);  // optional: ~100 MB/s reads in trusted env
+fn main() -> Result<()> {
+    let db = StreamDb::open("assets.db", Config::default())?;
 
     // Write binary stream
-    db.write_document("/textures/player.png", &mut Cursor::new(...))?;
+    db.insert(b"/textures/player.png", &[0x89, 0x50, 0x4E, 0x47])?;
 
     // Read back
-    let data = db.get("/textures/player.png")?;
-    
+    let data = db.get(b"/textures/player.png")?;
+
     // Suffix search: all .png files
-    let pngs = db.search_by_suffix(".png")?;
-    
+    let pngs = db.suffix_search(b".png")?;
+
+    db.flush()?;      // durable commit
+    db.compact()?;    // reclaim space from deletes/superseded commits
     Ok(())
 }
 ```
@@ -95,7 +104,7 @@ int main(void) {
 }
 ```
 
-Compile:  
+Compile:
 ```bash
 gcc -o example example.c -lstreamdb -lpthread -O2
 ```
@@ -113,12 +122,13 @@ Both implementations are functional and production-viable for many embedded/real
 
 **Rust-specific:**
 
-- Complete WAL checkpointing & recovery testing
+- Optional deterministic document IDs (UUID v5) for reproducible files
 - Full WASM integration tests
 - Python & C# bindings via FFI
 
 **C-specific:**
 
+- Port the v3 commit protocol (checksums, fsync, dual header slots)
 - Optional compression (miniz / lz4)
 - Read-write lock for better read concurrency
 - Memory-mapped I/O mode

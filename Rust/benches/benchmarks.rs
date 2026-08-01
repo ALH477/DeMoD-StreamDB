@@ -174,6 +174,56 @@ fn bench_db_suffix_search(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_file_backend(c: &mut Criterion) {
+    let mut group = c.benchmark_group("file_backend");
+
+    group.bench_function("insert_1KB", |b| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StreamDb::open(dir.path().join("b.db"), Default::default()).unwrap();
+        let value = vec![0u8; 1024];
+        let mut i = 0u64;
+        b.iter(|| {
+            let key = format!("key:{}", i);
+            i += 1;
+            black_box(db.insert(black_box(key.as_bytes()), black_box(&value)).unwrap())
+        });
+    });
+
+    group.bench_function("get_1KB", |b| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StreamDb::open(dir.path().join("b.db"), Default::default()).unwrap();
+        let value = vec![0u8; 1024];
+        let keys: Vec<Vec<u8>> = (0..1000u32)
+            .map(|i| {
+                let key = format!("key:{i}");
+                db.insert(key.as_bytes(), &value).unwrap();
+                key.into_bytes()
+            })
+            .collect();
+        b.iter(|| {
+            for key in &keys {
+                black_box(db.get(black_box(key)).unwrap());
+            }
+        });
+    });
+
+    group.bench_function("flush_1000_keys", |b| {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StreamDb::open(dir.path().join("b.db"), Default::default()).unwrap();
+        let value = vec![0u8; 64];
+        for i in 0..1000u32 {
+            db.insert(format!("key:{i}").as_bytes(), &value).unwrap();
+        }
+        b.iter(|| {
+            // Touch one key so flush has work to commit.
+            db.insert(b"touch", b"x").unwrap();
+            black_box(db.flush().unwrap());
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_trie_insert,
@@ -182,6 +232,7 @@ criterion_group!(
     bench_db_insert,
     bench_db_get,
     bench_db_suffix_search,
+    bench_file_backend,
 );
 
 criterion_main!(benches);
