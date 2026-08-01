@@ -492,6 +492,13 @@ impl FileBackend {
     /// re-committed as-is. Writes into a sibling temp file and renames over the
     /// original, so an interrupted compaction leaves the existing database
     /// untouched.
+    ///
+    /// Concurrency: the document map write-lock and the file lock are held for
+    /// the whole operation (lock order everywhere is documents -> file), so
+    /// `write()`/`delete()` block until the rename completes. A `write()` can
+    /// therefore never land at a stale offset inside the new inode, and a
+    /// `delete()` issued mid-compaction is applied to the new map rather than
+    /// being silently undone by it.
     pub fn compact(&self, trie: &Trie) -> Result<()> {
         // Drop the mapping first: it pins pages of the inode we're replacing.
         #[cfg(not(target_arch = "wasm32"))]
@@ -499,13 +506,17 @@ impl FileBackend {
             *self.mmap.write() = None;
         }
 
+        // Hold both locks for the entire compaction, iterating the LIVE map
+        // (not a stale snapshot) so deletes that landed before this call are
+        // honoured and writers/deleters block until the new file is in place.
+        let mut docs_guard = self.documents.write();
+        let mut file = self.file.lock();
+
         let tmp_path = {
             let mut p = self.path.clone().into_os_string();
             p.push(".compact");
             std::path::PathBuf::from(p)
         };
-
-        let mut file = self.file.lock();
 
         let mut out = OpenOptions::new()
             .read(true)
@@ -517,18 +528,11 @@ impl FileBackend {
         // Reserve both header slots; they are written last.
         out.write_all(&[0u8; DATA_START as usize])?;
 
-        let old_docs: Vec<(Uuid, DocumentMeta)> = self
-            .documents
-            .read()
-            .iter()
-            .map(|(id, meta)| (*id, meta.clone()))
-            .collect();
-
-        let mut new_docs = HashMap::with_capacity(old_docs.len());
+        let mut new_docs = HashMap::with_capacity(docs_guard.len());
         let mut total_size = 0u64;
         let mut offset = DATA_START;
 
-        for (id, meta) in &old_docs {
+        for (id, meta) in docs_guard.iter() {
             let mut data = vec![0u8; meta.size as usize];
             file.seek(SeekFrom::Start(meta.offset))?;
             file.read_exact(&mut data)?;
@@ -559,14 +563,7 @@ impl FileBackend {
         let trie_data = bincode::serialize(trie)?;
         let trie_crc = compute_checksum(&trie_data);
 
-        let mut index = Vec::with_capacity(8 + new_docs.len() * 32);
-        index.write_u64::<LittleEndian>(new_docs.len() as u64)?;
-        for (id, meta) in new_docs.iter() {
-            index.write_all(id.as_bytes())?;
-            index.write_u64::<LittleEndian>(meta.offset)?;
-            index.write_u32::<LittleEndian>(meta.size)?;
-            index.write_u32::<LittleEndian>(meta.checksum)?;
-        }
+        let index = serialize_index(&new_docs)?;
         let index_crc = compute_checksum(&index);
 
         let trie_offset = offset;
@@ -588,16 +585,22 @@ impl FileBackend {
         out.write_all(&header.encode())?;
         out.flush()?;
         out.sync_all()?;
+        drop(out);
 
         std::fs::rename(&tmp_path, &self.path)?;
+        // Make the rename itself durable: without an fsync of the directory a
+        // crash can lose the directory entry even though the new file's
+        // contents were fully synced.
+        sync_parent_dir(&self.path)?;
 
         *file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        *self.documents.write() = new_docs;
+        *docs_guard = new_docs;
         self.total_size.store(total_size, Ordering::SeqCst);
         self.next_offset.store(header.data_end, Ordering::SeqCst);
         self.seq.store(header.seq, Ordering::SeqCst);
 
         drop(file);
+        drop(docs_guard);
 
         #[cfg(not(target_arch = "wasm32"))]
         if self.config.use_mmap {
@@ -614,11 +617,14 @@ impl Backend for FileBackend {
         let id = Uuid::new_v4();
         let size = data.len() as u32;
         let checksum = Self::compute_document_checksum(data);
-        
-        // Allocate space
+
+        // Lock order is documents -> file everywhere. Holding the map lock
+        // across offset allocation AND the file write serialises us against
+        // compact(): an offset handed out here always belongs to the inode
+        // currently at `self.path`, because compaction cannot replace the
+        // file until we release the map lock.
+        let mut docs = self.documents.write();
         let offset = self.next_offset.fetch_add(size as u64 + 8, Ordering::SeqCst);
-        
-        // Write to file
         {
             let mut file = self.file.lock();
             file.seek(SeekFrom::Start(offset))?;
@@ -626,19 +632,14 @@ impl Backend for FileBackend {
             file.write_u32::<LittleEndian>(checksum)?;
             file.write_all(data)?;
         }
-        
-        // Update index
-        {
-            let mut docs = self.documents.write();
-            docs.insert(id, DocumentMeta {
-                offset: offset + 8, // Skip size/checksum header
-                size,
-                checksum,
-            });
-        }
-        
+        docs.insert(id, DocumentMeta {
+            offset: offset + 8, // Skip size/checksum header
+            size,
+            checksum,
+        });
+
         self.total_size.fetch_add(size as u64, Ordering::Relaxed);
-        
+
         Ok(id)
     }
     
@@ -716,17 +717,10 @@ impl Backend for FileBackend {
         let trie_crc = compute_checksum(&trie_data);
 
         // Serialise the document index into one blob so it gets a single CRC.
+        // Sorted by UUID: deterministic bytes for identical logical state.
         let index = {
             let docs = self.documents.read();
-            let mut buf = Vec::with_capacity(8 + docs.len() * 32);
-            buf.write_u64::<LittleEndian>(docs.len() as u64)?;
-            for (id, meta) in docs.iter() {
-                buf.write_all(id.as_bytes())?;
-                buf.write_u64::<LittleEndian>(meta.offset)?;
-                buf.write_u32::<LittleEndian>(meta.size)?;
-                buf.write_u32::<LittleEndian>(meta.checksum)?;
-            }
-            buf
+            serialize_index(&docs)?
         };
         let index_crc = compute_checksum(&index);
 
@@ -786,6 +780,45 @@ fn compute_checksum(data: &[u8]) -> u32 {
     let mut hasher = Crc32Hasher::new();
     hasher.update(data);
     hasher.finalize()
+}
+
+/// fsync the directory containing `path` so that a rename into it (used by
+/// `compact`) is durable across a crash. No-op off Unix.
+#[cfg(all(feature = "persistence", unix))]
+fn sync_parent_dir(path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// fsync the directory containing `path` so that a rename into it (used by
+/// `compact`) is durable across a crash. No-op off Unix.
+#[cfg(all(feature = "persistence", not(unix)))]
+fn sync_parent_dir(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+/// Serialise the document index into one blob with a single CRC.
+///
+/// Entries are sorted by UUID so identical logical state always produces
+/// identical bytes: `HashMap` iteration order is randomised per process, and
+/// without the sort two runs of the same workload would write different
+/// (though equally valid) index blobs and header CRCs.
+#[cfg(feature = "persistence")]
+fn serialize_index(docs: &HashMap<Uuid, DocumentMeta>) -> Result<Vec<u8>> {
+    let mut entries: Vec<(&Uuid, &DocumentMeta)> = docs.iter().collect();
+    entries.sort_unstable_by_key(|(id, _)| *id);
+
+    let mut buf = Vec::with_capacity(8 + entries.len() * 32);
+    buf.write_u64::<LittleEndian>(entries.len() as u64)?;
+    for (id, meta) in entries {
+        buf.write_all(id.as_bytes())?;
+        buf.write_u64::<LittleEndian>(meta.offset)?;
+        buf.write_u32::<LittleEndian>(meta.size)?;
+        buf.write_u32::<LittleEndian>(meta.checksum)?;
+    }
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -1209,5 +1242,154 @@ mod tests {
             assert!(backend.read(*id).unwrap().iter().all(|&b| b == *i as u8));
         }
         assert_eq!(trie2.get(b"1.doc"), None, "deleted key came back");
+    }
+
+    /// Identical logical state must serialize to identical index bytes:
+    /// `HashMap` iteration order is randomised per process, so the index
+    /// is written sorted by UUID (see `serialize_index`).
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn index_serialization_is_order_independent() {
+        let mut a = HashMap::new();
+        let mut b = HashMap::new();
+        let ids: Vec<Uuid> = (0..50).map(|_| Uuid::new_v4()).collect();
+
+        for (i, id) in ids.iter().enumerate() {
+            a.insert(
+                *id,
+                DocumentMeta {
+                    offset: (i * 40) as u64,
+                    size: 32,
+                    checksum: 0xDEAD_BEEF,
+                },
+            );
+        }
+        for (i, id) in ids.iter().enumerate().rev() {
+            b.insert(
+                *id,
+                DocumentMeta {
+                    offset: (i * 40) as u64,
+                    size: 32,
+                    checksum: 0xDEAD_BEEF,
+                },
+            );
+        }
+
+        assert_eq!(serialize_index(&a).unwrap(), serialize_index(&b).unwrap());
+    }
+
+    /// A `write()` that reserves an offset just before `compact()` swaps the
+    /// file must never land at that stale offset inside the new inode: every
+    /// document live at compact time must still read back checksum-clean.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn compact_survives_concurrent_writers() {
+        use std::sync::Arc;
+        use std::thread;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        let (backend, mut trie) = FileBackend::open(&path, &Config::default()).unwrap();
+        let backend = Arc::new(backend);
+
+        // Seed 60 docs, no flush: old next_offset sits right after the last
+        // document, which is exactly where the compacted file puts its
+        // trie/index blobs — the stale-offset clobber window.
+        let mut live = Vec::new();
+        for i in 0..60u32 {
+            let id = backend.write(&vec![i as u8; 512]).unwrap();
+            trie = trie.insert(format!("{i}.d").as_bytes(), id);
+            live.push((i, id));
+        }
+
+        // Large racer docs: keeps the writer mid-loop while compact() runs,
+        // so at least one write has reserved its offset pre-compact and
+        // blocks on the file lock until after the swap.
+        let b2 = Arc::clone(&backend);
+        let writer = thread::spawn(move || {
+            for j in 0..30u32 {
+                b2.write(&vec![j as u8; 64 * 1024]).unwrap();
+            }
+        });
+
+        backend.compact(&trie).unwrap();
+        writer.join().unwrap();
+        drop(backend);
+
+        let (backend, trie2) = FileBackend::open(&path, &Config::default()).unwrap();
+        for (i, id) in &live {
+            assert_eq!(
+                trie2.get(format!("{i}.d").as_bytes()),
+                Some(*id),
+                "key {i} lost across racing compaction"
+            );
+            let data = backend.read(*id).unwrap();
+            assert!(
+                data.iter().all(|&b| b == *i as u8),
+                "doc {i} clobbered by a racing write"
+            );
+        }
+    }
+
+    /// A `delete()` issued while `compact()` is mid-copy must be honoured:
+    /// the document must not reappear after reopening.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn compact_honours_deletes_that_land_mid_compaction() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("delrace.db");
+        let (backend, mut trie) = FileBackend::open(&path, &Config::default()).unwrap();
+        let backend = Arc::new(backend);
+
+        // Enough data that the copy phase takes long enough for a racing
+        // delete to land inside it.
+        let mut doomed = Vec::new();
+        for i in 0..2000u32 {
+            let id = backend.write(&vec![i as u8; 4096]).unwrap();
+            trie = trie.insert(format!("{i}.x").as_bytes(), id);
+            if i < 50 {
+                doomed.push((i, id));
+            }
+        }
+        backend.flush(&trie).unwrap();
+
+        let doomed_ids: Vec<Uuid> = doomed.iter().map(|(_, id)| *id).collect();
+        let b2 = Arc::clone(&backend);
+        let deleter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            for id in &doomed_ids {
+                b2.delete(*id).unwrap();
+            }
+        });
+
+        // Compact with a trie that already excludes the doomed keys.
+        let mut trie2 = trie;
+        for (i, _) in &doomed {
+            trie2 = trie2.remove(format!("{i}.x").as_bytes()).unwrap();
+        }
+        backend.compact(&trie2).unwrap();
+        deleter.join().unwrap();
+        backend.flush(&trie2).unwrap();
+        drop(backend);
+
+        let (backend, trie3) = FileBackend::open(&path, &Config::default()).unwrap();
+        for (i, id) in &doomed {
+            assert_eq!(trie3.get(format!("{i}.x").as_bytes()), None);
+            assert!(
+                backend.read(*id).is_err(),
+                "deleted document {i} resurrected by compaction"
+            );
+        }
+        // Survivors intact.
+        for i in 50..60u32 {
+            let id = trie3.get(format!("{i}.x").as_bytes()).unwrap();
+            assert!(backend.read(id).unwrap().iter().all(|&b| b == i as u8));
+        }
     }
 }
