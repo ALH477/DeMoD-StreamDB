@@ -30,7 +30,7 @@
 //!     
 //!     // Suffix search - find all keys ending with "alice"
 //!     let results = db.suffix_search(b"alice")?;
-//!     assert!(results.iter().any(|(k, _)| k == b"user:alice"));
+//!     assert!(results.iter().any(|r| r.key == b"user:alice"));
 //!     
 //!     Ok(())
 //! }
