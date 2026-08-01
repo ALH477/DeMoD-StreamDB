@@ -100,8 +100,11 @@ pub struct Config {
     pub cache_size: usize,
     
     /// Auto-flush interval in milliseconds (0 to disable, default: 5000)
+    ///
+    /// Reserved for a future auto-flush thread; not yet implemented —
+    /// call [`StreamDb::flush`] explicitly.
     pub flush_interval_ms: u64,
-    
+
     /// Enable memory-mapped I/O when available (default: true)
     pub use_mmap: bool,
 
@@ -111,14 +114,6 @@ pub struct Config {
     /// guarantees integrity (checksumming filesystem, ECC RAM), where the
     /// rehash cost is measurable on large values.
     pub verify_checksums_on_read: bool,
-    
-    /// Enable compression for values (default: false)
-    #[cfg(feature = "compression")]
-    pub use_compression: bool,
-    
-    /// Encryption key for data at rest (32 bytes for AES-256)
-    #[cfg(feature = "encryption")]
-    pub encryption_key: Option<[u8; 32]>,
 }
 
 impl Default for Config {
@@ -129,10 +124,6 @@ impl Default for Config {
             flush_interval_ms: 5000,
             use_mmap: true,
             verify_checksums_on_read: true,
-            #[cfg(feature = "compression")]
-            use_compression: false,
-            #[cfg(feature = "encryption")]
-            encryption_key: None,
         }
     }
 }

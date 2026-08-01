@@ -39,9 +39,9 @@
 //! streamdb_close(db);
 //! ```
 
-use crate::{StreamDb, Config, Error, Result, SearchResult};
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use crate::{Config, Error, Result, StreamDb};
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
@@ -159,10 +159,6 @@ impl StreamDbUuid {
         Self {
             bytes: *uuid.as_bytes(),
         }
-    }
-    
-    fn to_uuid(self) -> Uuid {
-        Uuid::from_bytes(self.bytes)
     }
 }
 

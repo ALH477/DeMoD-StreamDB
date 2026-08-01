@@ -25,12 +25,9 @@ required-features = ["cli"]
 default = ["std", "persistence"]
 std = []
 persistence = ["std", "fs2"]
-compression = ["lz4_flex"]
-encryption = ["ring"]
-async = ["tokio"]
 ffi = []
 cli = ["clap"]
-full = ["persistence", "compression", "encryption", "async", "ffi", "cli"]
+full = ["persistence", "ffi", "cli"]
 
 [dependencies]
 # Core
@@ -53,15 +50,6 @@ crc32fast = "1.3"
 # Caching
 lru = "0.12"
 
-# Optional: Compression
-lz4_flex = { version = "0.11", optional = true }
-
-# Optional: Encryption
-ring = { version = "0.17", optional = true }
-
-# Optional: Async runtime
-tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "fs", "io-util"], optional = true }
-
 # Optional: CLI
 clap = { version = "4.0", features = ["derive"], optional = true }
 
@@ -83,7 +71,6 @@ harness = false
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
 
 [profile.bench]

@@ -26,13 +26,9 @@ pub enum Error {
     
     /// Database is full or resource limit reached
     ResourceLimit(String),
-    
+
     /// Transaction error
     Transaction(String),
-    
-    /// Encryption/decryption error
-    #[cfg(feature = "encryption")]
-    Encryption(String),
 }
 
 impl fmt::Display for Error {
@@ -45,8 +41,6 @@ impl fmt::Display for Error {
             Error::Serialization(msg) => write!(f, "Serialization error: {}", msg),
             Error::ResourceLimit(msg) => write!(f, "Resource limit: {}", msg),
             Error::Transaction(msg) => write!(f, "Transaction error: {}", msg),
-            #[cfg(feature = "encryption")]
-            Error::Encryption(msg) => write!(f, "Encryption error: {}", msg),
         }
     }
 }
