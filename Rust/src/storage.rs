@@ -685,34 +685,36 @@ impl Backend for FileBackend {
             if let Some(mmap) = mmap_guard.as_ref() {
                 let start = meta.offset as usize;
                 let end = start + meta.size as usize;
-                
+
                 if end <= mmap.len() {
                     let data = mmap[start..end].to_vec();
-                    
-                    // Verify checksum
-                    let actual = compute_checksum(&data);
-                    if actual != meta.checksum {
-                        return Err(Error::Corrupted("Document checksum mismatch".into()));
+
+                    if self.config.verify_checksums_on_read {
+                        let actual = compute_checksum(&data);
+                        if actual != meta.checksum {
+                            return Err(Error::Corrupted("Document checksum mismatch".into()));
+                        }
                     }
-                    
+
                     return Ok(data);
                 }
             }
         }
-        
+
         // Fallback to file read
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(meta.offset))?;
-        
+
         let mut data = vec![0u8; meta.size as usize];
         file.read_exact(&mut data)?;
-        
-        // Verify checksum
-        let actual = compute_checksum(&data);
-        if actual != meta.checksum {
-            return Err(Error::Corrupted("Document checksum mismatch".into()));
+
+        if self.config.verify_checksums_on_read {
+            let actual = compute_checksum(&data);
+            if actual != meta.checksum {
+                return Err(Error::Corrupted("Document checksum mismatch".into()));
+            }
         }
-        
+
         Ok(data)
     }
     
@@ -1483,5 +1485,23 @@ mod tests {
 
         // Must load cleanly; exactly one valid newest commit.
         let (_b, _t) = FileBackend::open(&path, &Config::default()).unwrap();
+    }
+
+    /// Checksum verification on read defaults ON and can be disabled.
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn checksum_on_read_defaults_on_and_can_be_disabled() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crc.db");
+
+        let mut cfg = Config::default();
+        assert!(cfg.verify_checksums_on_read, "default must be ON");
+        cfg.verify_checksums_on_read = false;
+
+        let (backend, _trie) = FileBackend::open(&path, &cfg).unwrap();
+        let id = backend.write(b"data").unwrap();
+        assert_eq!(backend.read(id).unwrap(), b"data");
     }
 }

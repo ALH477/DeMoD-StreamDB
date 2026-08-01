@@ -187,6 +187,53 @@ impl Trie {
         results
     }
     
+    /// Search for keys ending with the given suffix, returning at most
+    /// `limit` matches.
+    ///
+    /// Same traversal order as [`Trie::suffix_search`] (byte-sorted by
+    /// reversed key), but the subtree walk stops early instead of
+    /// collecting every match.
+    pub fn suffix_search_limit(&self, suffix: &[u8], limit: usize) -> Vec<(Vec<u8>, Uuid)> {
+        let mut results = Vec::new();
+        if limit == 0 {
+            return results;
+        }
+
+        let reversed_suffix = reverse(suffix);
+        if let Some(node) = self.navigate(&reversed_suffix) {
+            let mut path = reversed_suffix.clone();
+            node.collect_all_limited(&mut path, &mut results, limit);
+        }
+
+        results
+    }
+
+    /// Collect up to `limit` key-value pairs in this subtree.
+    fn collect_all_limited(
+        &self,
+        current_path: &mut Vec<u8>,
+        results: &mut Vec<(Vec<u8>, Uuid)>,
+        limit: usize,
+    ) {
+        if results.len() >= limit {
+            return;
+        }
+
+        if let Some(id) = self.value {
+            let key: Vec<u8> = current_path.iter().rev().copied().collect();
+            results.push((key, id));
+        }
+
+        for (&byte, child) in &self.children {
+            if results.len() >= limit {
+                break;
+            }
+            current_path.push(byte);
+            child.collect_all_limited(current_path, results, limit);
+            current_path.pop();
+        }
+    }
+
     /// Navigate to a node following the given path.
     fn navigate(&self, path: &[u8]) -> Option<&Self> {
         match path.split_first() {
@@ -435,6 +482,26 @@ mod tests {
         assert_eq!(trie2.len(), 2);
     }
     
+    #[test]
+    fn test_suffix_search_limit() {
+        let trie = (0..100u32).fold(Trie::new(), |t, i| {
+            t.insert(format!("{i}:tag").as_bytes(), Uuid::new_v4())
+        });
+
+        let r = trie.suffix_search_limit(b":tag", 10);
+        assert_eq!(r.len(), 10);
+
+        let r = trie.suffix_search_limit(b":tag", 0);
+        assert!(r.is_empty());
+
+        // Limit above match count returns all matches.
+        let r = trie.suffix_search_limit(b":tag", 1000);
+        assert_eq!(r.len(), 100);
+
+        // No match.
+        assert!(trie.suffix_search_limit(b":nope", 10).is_empty());
+    }
+
     #[test]
     fn test_empty_trie() {
         let trie = Trie::new();

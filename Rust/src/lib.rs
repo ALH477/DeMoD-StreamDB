@@ -104,6 +104,13 @@ pub struct Config {
     
     /// Enable memory-mapped I/O when available (default: true)
     pub use_mmap: bool,
+
+    /// Verify per-document CRC32 checksums on every read (default: true).
+    ///
+    /// Disable only for read-mostly workloads on storage that already
+    /// guarantees integrity (checksumming filesystem, ECC RAM), where the
+    /// rehash cost is measurable on large values.
+    pub verify_checksums_on_read: bool,
     
     /// Enable compression for values (default: false)
     #[cfg(feature = "compression")]
@@ -121,6 +128,7 @@ impl Default for Config {
             cache_size: 10000,
             flush_interval_ms: 5000,
             use_mmap: true,
+            verify_checksums_on_read: true,
             #[cfg(feature = "compression")]
             use_compression: false,
             #[cfg(feature = "encryption")]
@@ -439,6 +447,49 @@ impl StreamDb {
             .collect())
     }
     
+    /// Search for keys ending with the given suffix, returning at most
+    /// `limit` matches.
+    ///
+    /// Same ordering as [`StreamDb::suffix_search`], but the subtree walk
+    /// stops early — use this when a popular suffix can match a large
+    /// number of keys.
+    pub fn suffix_search_limit(&self, suffix: &[u8], limit: usize) -> Result<Vec<SearchResult>> {
+        if suffix.is_empty() {
+            return Err(Error::InvalidInput("Suffix cannot be empty".into()));
+        }
+        if suffix.len() > MAX_KEY_LEN {
+            return Err(Error::InvalidInput(format!(
+                "Suffix too long: {} bytes (max {})",
+                suffix.len(),
+                MAX_KEY_LEN
+            )));
+        }
+
+        let trie = self.trie.read();
+        let results = trie.suffix_search_limit(suffix, limit);
+
+        Ok(results.into_iter()
+            .map(|(key, id)| SearchResult { key, id })
+            .collect())
+    }
+
+    /// Rewrite the database file keeping only live documents, reclaiming
+    /// space from deleted documents and superseded commits.
+    ///
+    /// Blocks concurrent writers for the duration of the rewrite. Only
+    /// available with the file backend.
+    #[cfg(feature = "persistence")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persistence")))]
+    pub fn compact(&self) -> Result<()> {
+        let snapshot = { self.trie.read().clone() };
+        let backend = self
+            .backend
+            .as_any()
+            .downcast_ref::<FileBackend>()
+            .ok_or_else(|| Error::InvalidInput("compact requires the file backend".into()))?;
+        backend.compact(&snapshot)
+    }
+
     /// Iterate over all key-value pairs
     ///
     /// The callback receives each key and document ID. Return `true` to continue,
@@ -730,5 +781,59 @@ mod tests {
                 "k{i} lost"
             );
         }
+    }
+
+    #[test]
+    fn test_suffix_search_limit() {
+        let db = StreamDb::open_memory().unwrap();
+        for i in 0..100u32 {
+            db.insert(format!("{i}:tag").as_bytes(), b"v").unwrap();
+        }
+
+        assert_eq!(db.suffix_search_limit(b":tag", 10).unwrap().len(), 10);
+        assert!(db.suffix_search_limit(b":tag", 0).unwrap().is_empty());
+        assert_eq!(db.suffix_search_limit(b":tag", 1000).unwrap().len(), 100);
+        assert!(db.suffix_search_limit(b"", 10).is_err());
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn test_compact_reclaims_and_preserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.db");
+
+        let db = StreamDb::open(&path, Config::default()).unwrap();
+        for i in 0..60u32 {
+            db.insert(format!("{i}.doc").as_bytes(), &vec![i as u8; 2048])
+                .unwrap();
+            if i % 3 != 0 {
+                db.delete(format!("{i}.doc").as_bytes()).unwrap();
+            }
+            // Flush every round so superseded commits pile up.
+            db.flush().unwrap();
+        }
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        db.compact().unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "no space reclaimed ({before} -> {after})");
+
+        // Live keys readable through the same handle...
+        for i in (0..60u32).filter(|i| i % 3 == 0) {
+            assert_eq!(
+                db.get(format!("{i}.doc").as_bytes()).unwrap().unwrap(),
+                vec![i as u8; 2048]
+            );
+        }
+        drop(db);
+
+        // ...and after reopening the rewritten file.
+        let db = StreamDb::open(&path, Config::default()).unwrap();
+        assert_eq!(db.len(), 20);
+        assert!(db.get(b"1.doc").unwrap().is_none());
+        assert_eq!(
+            db.get(b"0.doc").unwrap().unwrap(),
+            vec![0u8; 2048]
+        );
     }
 }
