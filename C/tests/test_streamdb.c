@@ -410,11 +410,21 @@ TEST(delete_all_keys) {
     
     streamdb_delete(db, (const unsigned char*)"a", 1);
     streamdb_delete(db, (const unsigned char*)"b", 1);
-    
+
+    /* Reads on the now-empty DB must not crash and must report "not found".
+     * Regression guard: deleting the last key prunes the trie up to the root,
+     * and streamdb_delete re-seeds an empty root so these readers (which
+     * dereference db->root) stay safe. */
+    size_t vsize = 0;
+    ASSERT_NULL(streamdb_get(db, (const unsigned char*)"a", 1, &vsize));
+    StreamDBResult* empty = streamdb_suffix_search(db, (const unsigned char*)"a", 1);
+    ASSERT_NULL(empty);
+    streamdb_free_results(empty);
+
     /* Database should still be usable */
     StreamDBStatus status = streamdb_insert(db, (const unsigned char*)"c", 1, "3", 2);
     ASSERT_EQ(status, STREAMDB_OK);
-    
+
     streamdb_free(db);
     return 0;
 }
